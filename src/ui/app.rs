@@ -1484,7 +1484,13 @@ impl App {
             let Mode::Resume(id) = &p.mode else { continue };
             if let Some(l) = self.live.get(id) {
                 let (surface, _) = super::theme::entrypoint(&l.entrypoint);
-                let state = if l.is_busy() { "trabajando" } else { "inactiva" };
+                let state = if l.is_busy() {
+                    "trabajando"
+                } else if l.is_waiting() {
+                    "esperando respuesta"
+                } else {
+                    "inactiva"
+                };
                 let since = util::relative_time(l.started_ms, now);
                 conflicts.push(Conflict {
                     item: i,
@@ -1865,7 +1871,7 @@ mod tests {
         let mut live = HashMap::new();
         live.insert(
             "s3".to_string(),
-            LiveSession { pid: 1, session_id: "s3".into(), cwd: String::new(), entrypoint: "claude-vscode".into(), status: "idle".into(), name: None, started_ms: 0 },
+            LiveSession { pid: 1, session_id: "s3".into(), entrypoint: "claude-vscode".into(), status: "idle".into(), ..Default::default() },
         );
         app.live = Arc::new(live);
         app.on_key(key(KeyCode::Enter));

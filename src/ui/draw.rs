@@ -70,9 +70,6 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         v.extend(spans);
         Line::from(v)
     };
-    let c = &app.catalog;
-    let live = app.live.len();
-    let busy = app.live.values().filter(|l| l.is_busy()).count();
     let ms = app.started.elapsed().as_millis();
 
     // Línea 0: aviso de bypass (prioritario) y rótulo, según el espacio.
@@ -89,20 +86,7 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
     if used(&l0) + util::width(label) + 2 <= w {
         l0.push(Span::styled(format!("  {label}"), faint()));
     }
-    let mut l1 = vec![
-        Span::styled(c.repos.len().to_string(), bold(TEXT)),
-        Span::styled(" repos  ·  ", faint()),
-        Span::styled(c.sessions.len().to_string(), bold(TEXT)),
-        Span::styled(" sesiones  ·  ", faint()),
-    ];
-    if busy > 0 {
-        app.needs_tick = true;
-        l1.push(Span::styled(format!("{} ", widgets::spinner(ms)), bold(AMBER)));
-    } else {
-        l1.push(Span::styled("● ", Style::new().fg(if live > 0 { GREEN } else { TEXT_FAINT })));
-    }
-    l1.push(Span::styled(live.to_string(), bold(TEXT)));
-    l1.push(Span::styled(if live == 1 { " activa" } else { " activas" }, faint()));
+    let l1 = count_spans(app, w, ms);
     let l2 = match app.progress {
         Some((d, t)) if d < t => {
             app.needs_tick = true;
@@ -133,6 +117,47 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
             cell.set_symbol("─").set_fg(color);
         }
     }
+}
+
+/// Conteos de la cabecera: repos, sesiones, activas, trabajando y en espera.
+/// Recorta por la izquierda si no cabe (los indicadores en vivo se quedan).
+fn count_spans(app: &mut App, w: usize, ms: u128) -> Vec<Span<'static>> {
+    let c = &app.catalog;
+    let live = app.live.len();
+    let busy = app.live.values().filter(|l| l.is_busy()).count();
+    let waiting = app.live.values().filter(|l| l.is_waiting()).count();
+    let sep = || Span::styled("  ·  ", faint());
+    let mut live_part = vec![
+        Span::styled("● ", Style::new().fg(if live > 0 { GREEN } else { TEXT_FAINT })),
+        Span::styled(live.to_string(), bold(TEXT)),
+        Span::styled(if live == 1 { " activa" } else { " activas" }, faint()),
+        sep(),
+    ];
+    if busy > 0 {
+        app.needs_tick = true;
+        live_part.push(Span::styled(format!("{} ", widgets::spinner(ms)), bold(AMBER)));
+        live_part.push(Span::styled(busy.to_string(), bold(AMBER)));
+        live_part.push(Span::styled(" trabajando", Style::new().fg(AMBER)));
+    } else {
+        live_part.push(Span::styled("✳ 0 trabajando", faint()));
+    }
+    if waiting > 0 {
+        live_part.push(sep());
+        live_part.push(Span::styled("◐ ", bold(AMBER)));
+        live_part.push(Span::styled(waiting.to_string(), bold(TEXT)));
+        live_part.push(Span::styled(if waiting == 1 { " espera respuesta" } else { " esperan respuesta" }, faint()));
+    }
+    let mut full = vec![
+        Span::styled(c.repos.len().to_string(), bold(TEXT)),
+        Span::styled(" repos", faint()),
+        sep(),
+        Span::styled(c.sessions.len().to_string(), bold(TEXT)),
+        Span::styled(" sesiones", faint()),
+        sep(),
+    ];
+    full.extend(live_part.iter().cloned());
+    let width = |v: &[Span<'static>]| v.iter().map(|s| s.width()).sum::<usize>();
+    if width(&full) <= w { full } else { live_part }
 }
 
 fn draw_crumb(f: &mut Frame, app: &App, area: Rect) {
@@ -207,6 +232,8 @@ fn live_icon(app: &mut App, id: &str) -> Option<Span<'static>> {
     if l.is_busy() {
         app.needs_tick = true;
         Some(Span::styled(format!("{} ", widgets::spinner(app.started.elapsed().as_millis())), bold(AMBER)))
+    } else if l.is_waiting() {
+        Some(Span::styled("◐ ", bold(AMBER)))
     } else {
         Some(Span::styled("● ", Style::new().fg(GREEN)))
     }

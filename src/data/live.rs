@@ -10,20 +10,34 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct LiveSession {
     pub pid: u32,
     pub session_id: String,
     pub cwd: String,
     pub entrypoint: String,
+    /// `busy` (trabajando), `idle` o `waiting` (espera al usuario).
     pub status: String,
+    /// Con `waiting`: qué espera («input needed», «dialog open»…).
+    pub waiting_for: Option<String>,
     pub name: Option<String>,
     pub started_ms: i64,
+    /// Tubería de mensajería entre sesiones (`\\.\pipe\LOCAL\cc-msg-…`).
+    pub socket: Option<String>,
+    /// Id de Remote Control (`session_…`) si la sesión está enlazada.
+    pub bridge_id: Option<String>,
+    /// Subagentes con actividad reciente (lo rellena el worker).
+    pub subagents: usize,
 }
 
 impl LiveSession {
+    /// Claude está procesando un turno.
     pub fn is_busy(&self) -> bool {
-        self.status != "idle"
+        self.status == "busy"
+    }
+    /// Claude espera una respuesta o permiso del usuario.
+    pub fn is_waiting(&self) -> bool {
+        self.status == "waiting"
     }
 }
 
@@ -38,7 +52,13 @@ struct Raw {
     entrypoint: String,
     #[serde(default)]
     status: String,
+    #[serde(rename = "waitingFor")]
+    waiting_for: Option<String>,
     name: Option<String>,
+    #[serde(rename = "messagingSocketPath")]
+    socket: Option<String>,
+    #[serde(rename = "bridgeSessionId")]
+    bridge_id: Option<String>,
     #[serde(rename = "startedAt", default)]
     started_at: i64,
     #[serde(rename = "procStart")]
@@ -78,8 +98,12 @@ pub fn scan(claude_home: &Path) -> HashMap<String, LiveSession> {
                 cwd: raw.cwd,
                 entrypoint: raw.entrypoint,
                 status: raw.status,
+                waiting_for: raw.waiting_for.filter(|w| !w.is_empty()),
                 name: raw.name.filter(|n| !n.is_empty()),
                 started_ms: raw.started_at,
+                socket: raw.socket.filter(|s| !s.is_empty()),
+                bridge_id: raw.bridge_id.filter(|s| !s.is_empty()),
+                subagents: 0,
             },
         );
     }
