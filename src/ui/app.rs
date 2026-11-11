@@ -13,7 +13,7 @@ use tachyonfx::Motion;
 use super::fx::Fx;
 use super::widgets::{ListState, TextInput};
 use crate::config::{Config, LaunchOptions, SessionRef, SessionSet, SetEntry, SetLayout, SetWindow, Shell, Target};
-use crate::data::{Catalog, LiveSession, WorkerCmd};
+use crate::data::{Catalog, LiveSession, UsageState, WorkerCmd};
 use crate::claude_settings::{self, BypassStatus};
 use crate::launch::{self, Env, LaunchItem, Mode, Placement};
 use crate::{paths, util};
@@ -326,6 +326,8 @@ pub struct App {
     pub env: Result<Env, String>,
     pub catalog: Arc<Catalog>,
     pub live: Arc<HashMap<String, LiveSession>>,
+    /// Uso del plan de Claude (barra de la cabecera).
+    pub usage: UsageState,
     pub progress: Option<(usize, usize)>,
     pub loaded: bool,
     pub home: HomeState,
@@ -361,6 +363,7 @@ impl App {
             cfg_error,
             catalog: Arc::new(Catalog::default()),
             live: Arc::new(HashMap::new()),
+            usage: if cfg.general.show_usage { UsageState::Loading } else { UsageState::Disabled },
             progress: None,
             loaded: false,
             home: HomeState {

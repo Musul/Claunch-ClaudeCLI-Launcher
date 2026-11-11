@@ -42,6 +42,7 @@ pub fn scan_config(cfg: &Config) -> ScanConfig {
         roots: cfg.scan_roots(),
         depth: cfg.general.scan_depth,
         exclude: cfg.general.scan_exclude.clone(),
+        usage: cfg.general.show_usage,
     }
 }
 
@@ -78,6 +79,7 @@ fn event_loop(terminal: &mut Term, app: &mut App, rx: &std::sync::mpsc::Receiver
                     app.sync_lists();
                 }
                 WorkerMsg::Live(l) => app.live = l,
+                WorkerMsg::Usage(u) => app.usage = u,
             }
             dirty = true;
         }
@@ -153,7 +155,7 @@ pub fn snapshot(args: &[String]) -> anyhow::Result<()> {
     let out = args.get(2).cloned().unwrap_or_else(|| "snapshot.html".into());
 
     let (cfg, cfg_error) = Config::load();
-    let mut app = load_blocking(cfg, cfg_error)?;
+    let mut app = load_blocking(cfg, cfg_error, true)?;
     app.toasts.clear();
     app.apply_snapshot_script(screen);
     let mut terminal = Terminal::new(TestBackend::new(w, h))?;
@@ -165,8 +167,11 @@ pub fn snapshot(args: &[String]) -> anyhow::Result<()> {
 }
 
 /// App con el catálogo completo ya indexado (sin TUI ni animaciones).
-fn load_blocking(cfg: Config, cfg_error: Option<String>) -> anyhow::Result<App> {
-    let (rx, _tx) = data::spawn_worker(scan_config(&cfg));
+/// Con `usage`, espera también la primera lectura del uso del plan (máx. 20 s).
+fn load_blocking(cfg: Config, cfg_error: Option<String>, usage: bool) -> anyhow::Result<App> {
+    let mut sc = scan_config(&cfg);
+    sc.usage &= usage;
+    let (rx, _tx) = data::spawn_worker(sc);
     let mut app = App::new(cfg, cfg_error, None);
     app.fx.enabled = false;
     // El worker manda primero el índice en disco (si hay) y, tras reindexar
@@ -184,9 +189,19 @@ fn load_blocking(cfg: Config, cfg_error: Option<String>) -> anyhow::Result<App> 
                 }
             }
             Ok(WorkerMsg::Live(l)) => app.live = l,
+            Ok(WorkerMsg::Usage(u)) => app.usage = u,
             Ok(WorkerMsg::Progress { .. }) => saw_progress = true,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("el indexador terminó sin catálogo"),
             Err(_) => {}
+        }
+    }
+    let usage_deadline = Instant::now() + Duration::from_secs(20);
+    while matches!(app.usage, data::UsageState::Loading) && Instant::now() < usage_deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(WorkerMsg::Usage(u)) => app.usage = u,
+            Ok(WorkerMsg::Live(l)) => app.live = l,
+            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     app.sync_lists();
@@ -196,7 +211,7 @@ fn load_blocking(cfg: Config, cfg_error: Option<String>) -> anyhow::Result<App> 
 /// `claunch open <set>`: lanza el set y espera la confirmación de arranque.
 pub fn open_set_headless(cfg: Config, idx: usize) -> anyhow::Result<()> {
     let name = cfg.sets[idx].name.clone();
-    let mut app = load_blocking(cfg, None)?;
+    let mut app = load_blocking(cfg, None, false)?;
     app.toasts.clear();
     app.launch_set(idx);
     if let Some(app::Modal::Guard(g)) = &app.modal {

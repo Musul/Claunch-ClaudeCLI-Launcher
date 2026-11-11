@@ -195,6 +195,9 @@ pub struct General {
     pub wt_profile: String,
     pub tab_color: String,
     pub animations: bool,
+    /// Barra de uso del plan de Claude en la cabecera (lee el token OAuth de
+    /// `~/.claude/.credentials.json` y consulta api.anthropic.com cada minuto).
+    pub show_usage: bool,
 }
 
 impl Default for General {
@@ -219,6 +222,7 @@ impl Default for General {
             wt_profile: String::new(),
             tab_color: "#D97757".into(),
             animations: true,
+            show_usage: true,
         }
     }
 }

@@ -3,6 +3,7 @@
 pub mod live;
 pub mod repos;
 pub mod sessions;
+pub mod usage;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ use crate::paths;
 pub use live::LiveSession;
 pub use repos::RootKind;
 pub use sessions::SessionMeta;
+pub use usage::UsageState;
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -178,12 +180,15 @@ pub struct ScanConfig {
     pub roots: Vec<PathBuf>,
     pub depth: usize,
     pub exclude: Vec<String>,
+    /// Consultar el uso del plan (`general.show_usage`).
+    pub usage: bool,
 }
 
 pub enum WorkerMsg {
     Progress { done: usize, total: usize },
     Catalog(Arc<Catalog>),
     Live(Arc<HashMap<String, LiveSession>>),
+    Usage(UsageState),
 }
 
 pub enum WorkerCmd {
@@ -256,6 +261,11 @@ impl State {
 pub fn spawn_worker(cfg: ScanConfig) -> (Receiver<WorkerMsg>, Sender<WorkerCmd>) {
     let (tx, rx) = mpsc::channel();
     let (cmd_tx, cmd_rx) = mpsc::channel();
+    if cfg.usage {
+        usage::spawn(cfg.claude_home.clone(), tx.clone());
+    } else {
+        let _ = tx.send(WorkerMsg::Usage(UsageState::Disabled));
+    }
     std::thread::Builder::new()
         .name("claunch-index".into())
         .spawn(move || worker(cfg, tx, cmd_rx))

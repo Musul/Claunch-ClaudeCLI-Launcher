@@ -10,7 +10,8 @@ use super::app::*;
 use super::theme::{self, *};
 use super::widgets::{self, ListState, clip, split_line};
 use crate::config::{SessionRef, SetLayout};
-use crate::data::{RootKind, Session};
+use crate::data::usage::{Limit, Usage};
+use crate::data::{RootKind, Session, UsageState};
 use crate::{launch, paths, util};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -71,42 +72,47 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         Line::from(v)
     };
     let ms = app.started.elapsed().as_millis();
+    let used = |v: &[Span<'static>]| v.iter().map(|s| s.width()).sum::<usize>();
 
-    // Línea 0: aviso de bypass (prioritario) y rótulo, según el espacio.
+    // Línea 0: aviso de bypass (prioritario) y estado: error, indexado o rótulo.
     let mut l0: Vec<Span<'static>> = Vec::new();
     let bypass_on = matches!(&app.bypass, Ok(b) if b.enabled);
     if bypass_on {
         l0.push(Span::styled(" ⚠ bypass global ", Style::new().fg(BG).bg(AMBER).add_modifier(Modifier::BOLD)));
     }
-    let used = |v: &Vec<Span<'static>>| v.iter().map(|s| s.width()).sum::<usize>();
     if bypass_on && used(&l0) + 18 <= w {
         l0.push(Span::styled("  B para cambiar", faint()));
     }
-    let label = concat!("Claude Code launcher v", env!("CARGO_PKG_VERSION"));
-    if used(&l0) + util::width(label) + 2 <= w {
-        l0.push(Span::styled(format!("  {label}"), faint()));
-    }
-    let l1 = count_spans(app, w, ms);
-    let l2 = match app.progress {
+    let status: Vec<Span<'static>> = match app.progress {
         Some((d, t)) if d < t => {
-            app.needs_tick = true;
-            let mut v = vec![Span::styled(format!("{} indexando ", widgets::spinner(ms)), accent())];
+            let mut v = vec![Span::styled(format!("  {} indexando ", widgets::spinner(ms)), accent())];
             v.extend(widgets::progress(d, t, 14));
             v.push(Span::styled(format!(" {d}/{t}"), faint()));
             v
         }
-        _ if !app.loaded => vec![Span::styled(format!("{} cargando…", widgets::spinner(ms)), accent())],
+        _ if !app.loaded => vec![Span::styled(format!("  {} cargando…", widgets::spinner(ms)), accent())],
         _ => match (&app.env, &app.cfg_error) {
-            (Err(_), _) => vec![Span::styled("⚠ falta claude o Git Bash", bold(RED))],
-            (_, Some(_)) => vec![Span::styled("⚠ config.toml inválido", bold(AMBER))],
-            _ => vec![Span::styled("índice al día", faint())],
+            (Err(_), _) => vec![Span::styled("  ⚠ falta claude o Git Bash", bold(RED))],
+            (_, Some(_)) => vec![Span::styled("  ⚠ config.toml inválido", bold(AMBER))],
+            _ => vec![Span::styled(concat!("  Claude Code launcher v", env!("CARGO_PKG_VERSION")), faint())],
         },
     };
     if !app.loaded || matches!(app.progress, Some((d, t)) if d < t) {
         app.needs_tick = true;
     }
+    if used(&l0) + used(&status) <= w {
+        l0.extend(status);
+    }
+
+    // Línea 1: uso del plan. Línea 2: conteos y sesiones en vivo.
+    let usage = usage_spans(app, w, ms);
+    let counts = count_spans(app, w, ms);
+    let lines = match usage {
+        Some(u) => vec![right(l0), right(u), right(counts)],
+        None => vec![right(l0), right(counts), Line::raw("")],
+    };
     if w > 10 {
-        f.render_widget(Paragraph::new(vec![right(l0), right(l1), right(l2)]), Rect::new(x, area.y, w as u16, 3));
+        f.render_widget(Paragraph::new(lines), Rect::new(x, area.y, w as u16, 3));
     }
     // Filete con degradado coral → borde.
     let y = area.y + 3;
@@ -158,6 +164,100 @@ fn count_spans(app: &mut App, w: usize, ms: u128) -> Vec<Span<'static>> {
     full.extend(live_part.iter().cloned());
     let width = |v: &[Span<'static>]| v.iter().map(|s| s.width()).sum::<usize>();
     if width(&full) <= w { full } else { live_part }
+}
+
+/// Barra de uso: verde < 60 %, ámbar < 85 %, rojo desde 85 %.
+fn usage_bar(pct: f64, width: usize, stale: bool) -> Vec<Span<'static>> {
+    let filled = ((pct / 100.0) * width as f64).round().clamp(0.0, width as f64) as usize;
+    let filled = if pct > 0.0 { filled.max(1) } else { 0 };
+    let color = if pct >= 85.0 { RED } else if pct >= 60.0 { AMBER } else { GREEN };
+    let color = if stale { theme::lerp(color, BG, 0.45) } else { color };
+    vec![Span::styled("▰".repeat(filled), Style::new().fg(color)), Span::styled("▱".repeat(width - filled), Style::new().fg(BORDER))]
+}
+
+/// «2 h 10 min», «45 min», «3 d 4 h» hasta `ms`.
+fn until(ms: i64, now: i64) -> String {
+    let mins = ((ms - now).max(0) + 59_999) / 60_000;
+    match mins {
+        0..=59 => format!("{mins} min"),
+        60..=1439 => {
+            let (h, m) = (mins / 60, mins % 60);
+            if m == 0 { format!("{h} h") } else { format!("{h} h {m} min") }
+        }
+        _ => {
+            let (d, h) = (mins / 1440, (mins % 1440) / 60);
+            if h == 0 { format!("{d} d") } else { format!("{d} d {h} h") }
+        }
+    }
+}
+
+fn window_spans(label: &str, win: &Limit, bar: usize, resets: bool, now: i64, stale: bool) -> Vec<Span<'static>> {
+    let mut v = vec![Span::styled(format!("{label} "), dim())];
+    v.extend(usage_bar(win.pct, bar, stale));
+    let pct_style = if stale { faint() } else { bold(TEXT) };
+    v.push(Span::styled(format!(" {:.0}%", win.pct), pct_style));
+    if resets && let Some(r) = win.resets_ms {
+        v.push(Span::styled(format!(" ↻ {}", until(r, now)), faint()));
+    }
+    v
+}
+
+/// Línea de uso del plan, de la versión más completa a la más corta que quepa.
+/// `None` si está desactivado.
+fn usage_spans(app: &mut App, w: usize, ms: u128) -> Option<Vec<Span<'static>>> {
+    let now = app.now_ms();
+    let (u, warn): (&Usage, Option<String>) = match &app.usage {
+        UsageState::Disabled => return None,
+        UsageState::Loading => {
+            app.needs_tick = true;
+            return Some(vec![Span::styled(format!("{} consultando el uso del plan…", widgets::spinner(ms)), faint())]);
+        }
+        UsageState::Ready(u) => (u, None),
+        UsageState::Failed { reason, last: Some(u) } => (u, Some(reason.clone())),
+        UsageState::Failed { reason, last: None } => {
+            // «⚠» se dibuja ancho en muchas fuentes: una columna de margen.
+            let text = util::truncate(&format!("uso del plan: {reason}"), w.saturating_sub(3));
+            return Some(vec![Span::styled("⚠ ", bold(AMBER)), Span::styled(text, faint())]);
+        }
+    };
+    let stale = warn.is_some() || now - u.fetched_ms > 3 * 60_000;
+    let plan = u.plan_label().map(|p| Span::styled(format!("Plan {p}   "), bold(ACCENT_SOFT)));
+    let tail = |v: &mut Vec<Span<'static>>, room: usize| {
+        if let Some(r) = &warn {
+            let used: usize = v.iter().map(|s| s.width()).sum();
+            let text = util::truncate(&format!("  ⚠ {r}"), room.saturating_sub(used));
+            if util::width(&text) > 4 {
+                v.push(Span::styled(text, Style::new().fg(AMBER)));
+            }
+        }
+    };
+    let head = u.headline();
+    // (barra, reinicios, cuántos límites, plan)
+    for (bar, resets, count, with_plan) in [
+        (10, true, 2, true),
+        (10, true, 2, false),
+        (8, false, 2, false),
+        (10, true, 1, true),
+        (8, true, 1, false),
+        (6, false, 1, false),
+    ] {
+        let mut v = Vec::new();
+        if with_plan && let Some(p) = &plan {
+            v.push(p.clone());
+        }
+        for (i, l) in head.iter().take(count).enumerate() {
+            if i > 0 {
+                v.push(Span::styled("   ", faint()));
+            }
+            v.extend(window_spans(&l.short, l, bar, resets, now, stale));
+        }
+        let width: usize = v.iter().map(|s| s.width()).sum();
+        if width <= w {
+            tail(&mut v, w);
+            return Some(v);
+        }
+    }
+    Some(vec![])
 }
 
 fn draw_crumb(f: &mut Frame, app: &App, area: Rect) {

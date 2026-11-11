@@ -20,6 +20,7 @@ uso:
   claunch open <set>            abre un set por nombre sin TUI
   claunch bypass [status|on|off] [--yes]
                                 bypass global de permisos (~/.claude/settings.json)
+  claunch usage [--json]        uso del plan de Claude (ventanas de 5 h y 7 días)
   claunch setup [--uninstall]   instala en ~/.local/bin y añade perfiles a Windows Terminal
   claunch --version
 
@@ -36,6 +37,7 @@ fn main() -> ExitCode {
         Some("bypass") => claude_settings::cli(rest),
         Some("setup") => setup::main(rest),
         Some("open") => open_set(rest),
+        Some("usage") => data::usage::cli(rest),
         Some("snapshot") => report(ui::snapshot(rest)),
         Some("-h" | "--help" | "help") => {
             print!("{HELP}");
