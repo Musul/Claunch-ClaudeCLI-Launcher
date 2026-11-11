@@ -579,7 +579,7 @@ fn draw_repo(f: &mut Frame, app: &mut App, area: Rect, key: &str, list: &mut Lis
     if live > 0 {
         l1.push(Span::styled(format!("   ● {live} activa{}", if live == 1 { "" } else { "s" }), Style::new().fg(GREEN)));
     }
-    let l2 = vec![Span::raw(" "), Span::styled(repo.root.to_string_lossy().into_owned(), faint())];
+    let l2 = vec![Span::raw(" "), Span::styled(paths::display(&repo.root), faint())];
     f.render_widget(Paragraph::new(vec![Line::from(l1), Line::from(l2)]), head);
 
     let rows = app.session_rows(key, filter.text(), pick);
