@@ -15,6 +15,24 @@ use serde_json::value::RawValue;
 
 const FINGERPRINT_LEN: u64 = 128;
 const MAX_TEXT: usize = 280;
+/// Mensajes entre sesiones que se guardan por sesión (los más recientes).
+pub const MAX_LINKS: usize = 100;
+
+/// Un mensaje entre sesiones visto en el historial de esta sesión.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PeerLink {
+    /// `true`: esta sesión lo envió (`SendMessage`); `false`: lo recibió.
+    pub out: bool,
+    /// Otro extremo: `uds:<tubería>`, `bridge:session_…` o un nombre de sesión.
+    pub peer: String,
+    /// Nombre visible del otro extremo (en los recibidos).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `msg_id` del recibido (evita duplicados).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub ts_ms: i64,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionMeta {
@@ -39,6 +57,9 @@ pub struct SessionMeta {
     /// Prompts humanos (sin tool results ni mensajes de sistema).
     pub prompts: u32,
     pub has_messages: bool,
+    /// Mensajes con otras sesiones (máximo `MAX_LINKS`, del más viejo al más nuevo).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<PeerLink>,
 }
 
 impl SessionMeta {
@@ -86,6 +107,39 @@ struct Line<'a> {
     last_prompt: Option<String>,
     #[serde(rename = "prNumber")]
     pr_number: Option<u64>,
+    origin: Option<Origin>,
+}
+
+/// `origin` de un mensaje recibido de otra sesión (`kind = "peer"`).
+#[derive(Deserialize)]
+struct Origin {
+    kind: Option<String>,
+    from: Option<String>,
+    name: Option<String>,
+    msg_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ToolMessage<'a> {
+    #[serde(borrow)]
+    content: Option<Vec<ToolBlock<'a>>>,
+}
+
+#[derive(Deserialize)]
+struct ToolBlock<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Cow<'a, str>,
+    #[serde(borrow)]
+    name: Option<Cow<'a, str>>,
+    input: Option<SendInput>,
+}
+
+/// Entrada de la herramienta `SendMessage` (solo los campos de destino).
+#[derive(Deserialize)]
+struct SendInput {
+    to: Option<String>,
+    recipient: Option<String>,
+    recipient_kind: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -193,12 +247,13 @@ fn parse_lines(buf: &[u8], meta: &mut SessionMeta) -> usize {
             }
         }
         let Ok(l) = serde_json::from_slice::<Line>(line) else { continue };
-        apply(l, meta);
+        let sends = memchr::memmem::find(line, b"\"SendMessage\"").is_some();
+        apply(l, meta, sends);
     }
     pos
 }
 
-fn apply(l: Line, meta: &mut SessionMeta) {
+fn apply(l: Line, meta: &mut SessionMeta, sends: bool) {
     let kind = l.kind.as_deref().unwrap_or("");
     match kind {
         "custom-title" => set_text(&mut meta.custom_title, l.custom_title),
@@ -231,6 +286,34 @@ fn apply(l: Line, meta: &mut SessionMeta) {
         return;
     }
     meta.has_messages = true;
+    let ts_ms = || l.timestamp.as_deref().and_then(|t| t.parse::<jiff::Timestamp>().ok()).map(|t| t.as_millisecond());
+    if let Some(o) = l.origin.as_ref().filter(|o| o.kind.as_deref() == Some("peer"))
+        && let (Some(from), Some(ts)) = (o.from.as_deref().filter(|f| !f.is_empty()), ts_ms())
+        && o.msg_id.as_ref().is_none_or(|id| !meta.links.iter().any(|x| x.id.as_ref() == Some(id)))
+    {
+        push_link(meta, PeerLink { out: false, peer: from.to_string(), name: o.name.clone(), id: o.msg_id.clone(), ts_ms: ts });
+    }
+    if kind == "assistant"
+        && sends
+        && let Some(ts) = ts_ms()
+        && let Some(raw) = l.message
+        && let Ok(msg) = serde_json::from_str::<ToolMessage>(raw.get())
+    {
+        for b in msg.content.unwrap_or_default() {
+            if b.kind != "tool_use" || b.name.as_deref() != Some("SendMessage") {
+                continue;
+            }
+            let Some(input) = b.input else { continue };
+            if input.recipient_kind.as_deref() == Some("agent") {
+                continue;
+            }
+            let Some(to) = input.to.or(input.recipient).map(|t| t.trim().to_string()) else { continue };
+            if to.is_empty() || to == "*" || is_agent_id(&to) {
+                continue;
+            }
+            push_link(meta, PeerLink { out: true, peer: to, name: None, id: None, ts_ms: ts });
+        }
+    }
     if meta.entrypoint.is_none() {
         meta.entrypoint = l.entrypoint.map(Cow::into_owned);
     }
@@ -275,6 +358,19 @@ fn apply(l: Line, meta: &mut SessionMeta) {
             meta.first_prompt = Some(p);
         }
     }
+}
+
+fn push_link(meta: &mut SessionMeta, link: PeerLink) {
+    meta.links.push(link);
+    if meta.links.len() > MAX_LINKS {
+        let extra = meta.links.len() - MAX_LINKS;
+        meta.links.drain(..extra);
+    }
+}
+
+/// Id de subagente (`a` + 16 hex): mensajes internos de la sesión, no entre sesiones.
+fn is_agent_id(s: &str) -> bool {
+    s.len() == 17 && s.starts_with('a') && s[1..].bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn set_text(slot: &mut Option<String>, value: Option<String>) {
@@ -431,6 +527,24 @@ mod tests {
         let m = index_file(&p, None).unwrap();
         assert_eq!(m.indexed_to, USER.len() as u64 + 1);
         assert_eq!(m.ai_title, None);
+    }
+
+    const PEER_IN: &str = r#"{"type":"user","isMeta":true,"timestamp":"2026-11-04T15:30:31.739Z","cwd":"c:/Users/X/repo","message":{"role":"user","content":"x"},"origin":{"kind":"peer","from":"uds:cc-msg-1","name":"Otra","msg_id":"m1","body":"hola"}}"#;
+    const PEER_OUT: &str = r#"{"type":"assistant","timestamp":"2026-11-04T15:31:00.000Z","cwd":"c:/Users/X/repo","message":{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"t1","name":"SendMessage","input":{"to":"bridge:session_01ABC","message":"hola","recipient_kind":"session"}},{"type":"tool_use","id":"t2","name":"SendMessage","input":{"to":"a9c576fceb902380d","message":"x"}}]}}"#;
+
+    #[test]
+    fn captures_peer_links() {
+        let content = format!("{USER}\n{PEER_IN}\n{PEER_IN}\n{PEER_OUT}\n");
+        let p = write_tmp("a5.jsonl", &content);
+        let m = index_file(&p, None).unwrap();
+        assert_eq!(m.links.len(), 2, "{:?}", m.links);
+        assert!(!m.links[0].out);
+        assert_eq!(m.links[0].peer, "uds:cc-msg-1");
+        assert_eq!(m.links[0].name.as_deref(), Some("Otra"));
+        assert!(m.links[1].out);
+        assert_eq!(m.links[1].peer, "bridge:session_01ABC");
+        // Los mensajes de sistema no cuentan como prompts.
+        assert_eq!(m.prompts, 1);
     }
 
     #[test]

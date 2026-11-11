@@ -79,6 +79,7 @@ fn event_loop(terminal: &mut Term, app: &mut App, rx: &std::sync::mpsc::Receiver
                     app.sync_lists();
                 }
                 WorkerMsg::Live(l) => app.live = l,
+                WorkerMsg::Aliases(a) => app.aliases = a,
                 WorkerMsg::Usage(u) => app.usage = u,
             }
             dirty = true;
@@ -189,6 +190,7 @@ fn load_blocking(cfg: Config, cfg_error: Option<String>, usage: bool) -> anyhow:
                 }
             }
             Ok(WorkerMsg::Live(l)) => app.live = l,
+            Ok(WorkerMsg::Aliases(a)) => app.aliases = a,
             Ok(WorkerMsg::Usage(u)) => app.usage = u,
             Ok(WorkerMsg::Progress { .. }) => saw_progress = true,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("el indexador terminó sin catálogo"),
@@ -200,6 +202,7 @@ fn load_blocking(cfg: Config, cfg_error: Option<String>, usage: bool) -> anyhow:
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(WorkerMsg::Usage(u)) => app.usage = u,
             Ok(WorkerMsg::Live(l)) => app.live = l,
+            Ok(WorkerMsg::Aliases(a)) => app.aliases = a,
             Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }

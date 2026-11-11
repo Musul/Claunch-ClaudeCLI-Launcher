@@ -13,7 +13,8 @@ use tachyonfx::Motion;
 use super::fx::Fx;
 use super::widgets::{ListState, TextInput};
 use crate::config::{Config, LaunchOptions, SessionRef, SessionSet, SetEntry, SetLayout, SetWindow, Shell, Target};
-use crate::data::{Catalog, LiveSession, UsageState, WorkerCmd};
+use crate::data::graph::{self, Graph};
+use crate::data::{Aliases, Catalog, LiveSession, UsageState, WorkerCmd};
 use crate::claude_settings::{self, BypassStatus};
 use crate::launch::{self, Env, LaunchItem, Mode, Placement};
 use crate::{paths, util};
@@ -44,6 +45,7 @@ pub enum ListId {
     Sessions,
     PickRepos,
     SetRows,
+    MapNodes,
 }
 
 /// Región clicable registrada al dibujar.
@@ -84,6 +86,21 @@ pub enum Screen {
     Repo { key: String, list: ListState, filter: Filter, pick: Option<PickCtx> },
     PickRepo { list: ListState, filter: Filter, ctx: PickCtx },
     SetEditor { set: usize, row: usize, name: TextInput },
+    /// Mapa de sesiones: `sel` es la clave del nodo elegido; `window`, índice en `MAP_WINDOWS`.
+    Map { sel: Option<String>, window: usize },
+}
+
+/// Ventanas de tiempo del mapa: (milisegundos, rótulo).
+pub const MAP_WINDOWS: [(i64, &str); 3] = [(3_600_000, "1 h"), (86_400_000, "24 h"), (7 * 86_400_000, "7 días")];
+/// Nodos que caben en el mapa sin volverse ilegible.
+pub const MAP_MAX_NODES: usize = 18;
+
+struct GraphCache {
+    at: Instant,
+    window: usize,
+    catalog: Arc<Catalog>,
+    live: Arc<HashMap<String, LiveSession>>,
+    graph: Arc<Graph>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -326,8 +343,10 @@ pub struct App {
     pub env: Result<Env, String>,
     pub catalog: Arc<Catalog>,
     pub live: Arc<HashMap<String, LiveSession>>,
+    pub aliases: Arc<Aliases>,
     /// Uso del plan de Claude (barra de la cabecera).
     pub usage: UsageState,
+    graph_cache: Option<GraphCache>,
     pub progress: Option<(usize, usize)>,
     pub loaded: bool,
     pub home: HomeState,
@@ -363,7 +382,9 @@ impl App {
             cfg_error,
             catalog: Arc::new(Catalog::default()),
             live: Arc::new(HashMap::new()),
+            aliases: Arc::new(Aliases::new()),
             usage: if cfg.general.show_usage { UsageState::Loading } else { UsageState::Disabled },
+            graph_cache: None,
             progress: None,
             loaded: false,
             home: HomeState {
@@ -459,6 +480,7 @@ impl App {
                     v.push("elegir repo".into());
                 }
                 Screen::SetEditor { set, .. } => v.push(format!("Set: {}", self.set_name(*set))),
+                Screen::Map { .. } => v.push("Mapa de sesiones".into()),
             }
         }
         v
@@ -577,10 +599,37 @@ impl App {
                     let keys: Vec<String> = self.repo_rows(filter.text()).into_iter().map(|i| self.catalog.repos[i].key.clone()).collect();
                     list.sync(&keys);
                 }
-                Screen::SetEditor { .. } => {}
+                Screen::SetEditor { .. } | Screen::Map { .. } => {}
             }
         }
         self.stack = stack;
+    }
+
+    /// Grafo de sesiones de la ventana `window`, recalculado como mucho cada segundo
+    /// (o al llegar sesiones vivas o catálogo nuevos).
+    pub fn graph(&mut self, window: usize) -> Arc<Graph> {
+        if let Some(c) = &self.graph_cache
+            && c.window == window
+            && c.at.elapsed() < Duration::from_secs(1)
+            && Arc::ptr_eq(&c.catalog, &self.catalog)
+            && Arc::ptr_eq(&c.live, &self.live)
+        {
+            return c.graph.clone();
+        }
+        let ms = MAP_WINDOWS[window.min(MAP_WINDOWS.len() - 1)].0;
+        let g = Arc::new(graph::build(&self.catalog, &self.live, &self.aliases, self.now_ms(), ms, MAP_MAX_NODES));
+        self.graph_cache = Some(GraphCache {
+            at: Instant::now(),
+            window,
+            catalog: self.catalog.clone(),
+            live: self.live.clone(),
+            graph: g.clone(),
+        });
+        g
+    }
+
+    fn open_map(&mut self) {
+        self.push(Screen::Map { sel: None, window: 1 });
     }
 
     pub fn home_list(&mut self, p: Panel) -> &mut ListState {
@@ -756,6 +805,7 @@ impl App {
             KeyCode::Enter => self.activate_home(false),
             KeyCode::Char('o') => self.activate_home(true),
             KeyCode::Char('n') => self.new_set(),
+            KeyCode::Char('m') => self.open_map(),
             KeyCode::Char('B') => self.ask_bypass(),
             KeyCode::Char('e') if focus == Panel::Sets => {
                 if let Some(i) = self.selected_set() {
@@ -860,6 +910,7 @@ impl App {
             Screen::Repo { .. } => self.repo_key(&mut screen, key),
             Screen::PickRepo { .. } => self.pick_key(&mut screen, key),
             Screen::SetEditor { .. } => self.editor_key(&mut screen, key),
+            Screen::Map { .. } => self.map_key(&mut screen, key),
         };
         if keep {
             self.stack.insert(base.min(self.stack.len()), screen);
@@ -908,6 +959,54 @@ impl App {
                         if with_options { self.options_for_session(i) } else { self.launch_session(i) }
                     }
                     _ => {}
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
+    fn map_key(&mut self, screen: &mut Screen, key: KeyEvent) -> bool {
+        let Screen::Map { sel, window } = screen else { return true };
+        let g = self.graph(*window);
+        let n = g.nodes.len();
+        let cur = sel.as_deref().and_then(|k| g.index_of(k));
+        let mut step = |d: isize| {
+            if n > 0 {
+                let i = match cur {
+                    Some(i) => (i as isize + d).rem_euclid(n as isize) as usize,
+                    None => 0,
+                };
+                *sel = Some(g.nodes[i].key.clone());
+            }
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => return false,
+            KeyCode::Char('q') => self.quit = true,
+            KeyCode::Char('?') => self.open_modal(Modal::Help),
+            KeyCode::Char('r') | KeyCode::F(5) => self.refresh(),
+            KeyCode::Up | KeyCode::Left | KeyCode::Char('k') | KeyCode::Char('h') | KeyCode::BackTab => step(-1),
+            KeyCode::Down | KeyCode::Right | KeyCode::Char('j') | KeyCode::Char('l') | KeyCode::Tab => step(1),
+            KeyCode::Char('t') => {
+                *window = (*window + 1) % MAP_WINDOWS.len();
+                self.graph_cache = None;
+            }
+            KeyCode::Enter => {
+                let id = cur.and_then(|i| g.nodes[i].session_id.clone());
+                match id.as_deref().and_then(|id| self.catalog.by_id.get(id).copied()) {
+                    Some(si) => {
+                        let repo_key = self.catalog.sessions[si].repo_key.clone();
+                        self.open_repo(repo_key.clone(), None);
+                        let rows = self.session_rows(&repo_key, "", false);
+                        let keys = self.sess_keys(&rows);
+                        if let Some(pos) = rows.iter().position(|r| *r == SessRow::Session(si))
+                            && let Some(Screen::Repo { list, .. }) = self.stack.last_mut()
+                        {
+                            list.select(pos, &keys);
+                        }
+                    }
+                    None if cur.is_some() => self.toast(ToastKind::Info, "Esa sesión no está en este equipo"),
+                    None => {}
                 }
             }
             _ => {}
@@ -1633,6 +1732,17 @@ impl App {
                         let keys: Vec<String> = self.repo_rows(filter.text()).into_iter().map(|i| self.catalog.repos[i].key.clone()).collect();
                         l.select(idx, &keys);
                     }
+                    Some(Screen::Map { window, .. }) => {
+                        if list == ListId::MapNodes {
+                            let w = *window;
+                            self.stack = stack;
+                            let g = self.graph(w);
+                            stack = std::mem::take(&mut self.stack);
+                            if let (Some(node), Some(Screen::Map { sel, .. })) = (g.nodes.get(idx), stack.last_mut()) {
+                                *sel = Some(node.key.clone());
+                            }
+                        }
+                    }
                     Some(Screen::SetEditor { row, set, name }) => {
                         if *row == 0 && idx != 0 {
                             let n = name.clone();
@@ -1694,6 +1804,8 @@ impl App {
                 }
             }
             "help" => self.modal = Some(Modal::Help),
+            "map" => self.stack.push(Screen::Map { sel: None, window: 1 }),
+            "map-week" => self.stack.push(Screen::Map { sel: None, window: 2 }),
             "bypass" => self.ask_bypass(),
             "repo" | "options" | "new" | "guard" => {
                 self.open_repo(repo_key.clone(), None);

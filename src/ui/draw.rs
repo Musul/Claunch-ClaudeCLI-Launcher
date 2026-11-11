@@ -10,6 +10,7 @@ use super::app::*;
 use super::theme::{self, *};
 use super::widgets::{self, ListState, clip, split_line};
 use crate::config::{SessionRef, SetLayout};
+use crate::data::graph::{Graph, Status};
 use crate::data::usage::{Limit, Usage};
 use crate::data::{RootKind, Session, UsageState};
 use crate::{launch, paths, util};
@@ -40,6 +41,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Some(Screen::Repo { key, list, filter, pick }) => draw_repo(f, app, body, key, list, filter, pick.is_some()),
         Some(Screen::PickRepo { list, filter, .. }) => draw_pick(f, app, body, list, filter),
         Some(Screen::SetEditor { set, row, name }) => draw_editor(f, app, body, *set, *row, name),
+        Some(Screen::Map { sel, window }) => draw_map(f, app, body, sel, *window),
     }
     app.stack = stack;
     draw_footer(f, app, footer);
@@ -297,8 +299,8 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 ("/", "filtrar"), ("?", "ayuda"), ("q", "salir"),
             ],
             _ => vec![
-                ("↑↓", "mover"), ("⏎", "abrir"), ("o", "opciones"), ("⇥", "panel"), ("/", "filtrar"), ("n", "nuevo set"),
-                ("B", "bypass"), ("?", "ayuda"), ("q", "salir"),
+                ("↑↓", "mover"), ("⏎", "abrir"), ("o", "opciones"), ("⇥", "panel"), ("/", "filtrar"), ("m", "mapa"),
+                ("n", "nuevo set"), ("B", "bypass"), ("?", "ayuda"), ("q", "salir"),
             ],
         },
         (None, Some(Screen::Repo { pick: Some(_), .. })) => vec![("↑↓", "mover"), ("⏎", "elegir"), ("/", "filtrar"), ("esc", "volver")],
@@ -306,6 +308,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             vec![("↑↓", "mover"), ("⏎", "abrir"), ("o", "opciones"), ("/", "filtrar"), ("r", "refrescar"), ("esc", "volver")]
         }
         (None, Some(Screen::PickRepo { .. })) => vec![("↑↓", "mover"), ("⏎", "elegir repo"), ("/", "filtrar"), ("esc", "volver")],
+        (None, Some(Screen::Map { .. })) => {
+            vec![("↑↓", "elegir sesión"), ("⏎", "ir al repo"), ("t", "ventana de tiempo"), ("r", "refrescar"), ("esc", "volver")]
+        }
         (None, Some(Screen::SetEditor { .. })) => vec![
             ("↑↓", "mover"), ("←→", "cambiar"), ("⏎", "editar/abrir"), ("a", "añadir"), ("⇧↑↓", "reordenar"), ("d", "quitar"),
             ("esc", "volver"),
@@ -834,6 +839,359 @@ fn draw_layout_preview(f: &mut Frame, app: &App, area: Rect, s: &crate::config::
     }
 }
 
+// ---------------------------------------------------------------- mapa
+
+/// Arista «caliente»: hubo un mensaje hace menos de esto (se anima).
+const HOT_MS: i64 = 120_000;
+
+fn status_icon(st: Status, ms: u128) -> (String, Style) {
+    match st {
+        Status::Busy => (widgets::spinner(ms).to_string(), bold(AMBER)),
+        Status::Waiting => ("◐".into(), bold(AMBER)),
+        Status::Idle => ("●".into(), Style::new().fg(GREEN)),
+        Status::Closed => ("○".into(), faint()),
+        Status::Remote => ("◇".into(), Style::new().fg(BLUE)),
+        Status::Unknown => ("·".into(), faint()),
+    }
+}
+
+fn status_word(st: Status) -> &'static str {
+    match st {
+        Status::Busy => "trabajando",
+        Status::Waiting => "espera respuesta",
+        Status::Idle => "inactiva",
+        Status::Closed => "cerrada",
+        Status::Remote => "otra máquina",
+        Status::Unknown => "sin identificar",
+    }
+}
+
+/// Centros de las fichas (en celdas, relativos a `area`): elipse inicial y luego
+/// separación iterativa para que no se pisen. `sizes`: ancho y alto de cada ficha.
+fn map_layout(sizes: &[(f64, f64)], area: Rect) -> Vec<(f64, f64)> {
+    let n = sizes.len();
+    let (w, h) = (area.width as f64, area.height as f64);
+    let (cx, cy) = (w / 2.0, h / 2.0);
+    if n == 1 {
+        return vec![(cx, cy)];
+    }
+    let max_w = sizes.iter().map(|s| s.0).fold(0.0, f64::max);
+    let rx = ((w - max_w) / 2.0 - 1.0).max(1.0);
+    let ry = ((h - 2.0) / 2.0 - 0.5).max(1.0);
+    let stagger = n > 10;
+    let mut pos: Vec<(f64, f64)> = (0..n)
+        .map(|i| {
+            let a = -std::f64::consts::FRAC_PI_2 + std::f64::consts::TAU * i as f64 / n as f64;
+            let k = if stagger && i % 2 == 1 { 0.55 } else { 1.0 };
+            (cx + rx * k * a.cos(), cy + ry * k * a.sin())
+        })
+        .collect();
+    let clamp = |p: &mut (f64, f64), s: (f64, f64)| {
+        p.0 = p.0.clamp(s.0 / 2.0, (w - s.0 / 2.0).max(s.0 / 2.0));
+        p.1 = p.1.clamp(1.0, (h - 1.0).max(1.0));
+    };
+    for _ in 0..400 {
+        let mut moved = false;
+        for i in 0..n {
+            for j in i + 1..n {
+                let (dx, dy) = (pos[j].0 - pos[i].0, pos[j].1 - pos[i].1);
+                // Separación mínima: medio ancho de cada una + 2 columnas; alto + 1 fila.
+                let ox = (sizes[i].0 + sizes[j].0) / 2.0 + 2.0 - dx.abs();
+                let oy = (sizes[i].1 + sizes[j].1) / 2.0 + 1.0 - dy.abs();
+                if ox <= 0.0 || oy <= 0.0 {
+                    continue;
+                }
+                moved = true;
+                // Empuja por el eje con menos solape (en filas cuesta el doble: celdas altas).
+                if oy * 2.0 < ox {
+                    let d = if dy >= 0.0 { oy / 2.0 } else { -oy / 2.0 };
+                    pos[i].1 -= d;
+                    pos[j].1 += d;
+                } else {
+                    let d = if dx >= 0.0 { ox / 2.0 } else { -ox / 2.0 };
+                    pos[i].0 -= d;
+                    pos[j].0 += d;
+                }
+                clamp(&mut pos[i], sizes[i]);
+                clamp(&mut pos[j], sizes[j]);
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+    pos
+}
+
+fn draw_map(f: &mut Frame, app: &mut App, area: Rect, sel: &mut Option<String>, window: usize) {
+    use ratatui::widgets::canvas::{Canvas, Line as CLine};
+    let g = app.graph(window);
+    let ms = app.started.elapsed().as_millis();
+    let now = app.now_ms();
+    let wlabel = MAP_WINDOWS[window.min(MAP_WINDOWS.len() - 1)].1;
+    if sel.as_deref().and_then(|k| g.index_of(k)).is_none() {
+        // Por defecto, la sesión con más mensajes.
+        let degree = |i: usize| g.edges.iter().filter(|e| e.from == i || e.to == i).map(|e| e.count).sum::<u32>();
+        *sel = (0..g.nodes.len()).max_by_key(|&i| (degree(i), std::cmp::Reverse(i))).map(|i| g.nodes[i].key.clone());
+    }
+    let si = sel.as_deref().and_then(|k| g.index_of(k));
+
+    let wide = area.width >= 100;
+    let (left, right) = if wide {
+        let [l, r] = Layout::horizontal([Constraint::Fill(1), Constraint::Length(44)]).spacing(1).areas(area);
+        (l, Some(r))
+    } else {
+        (area, None)
+    };
+    let links = g.edges.len();
+    let mut block = widgets::panel("Mapa de sesiones", Some(g.nodes.len()), app.modal.is_none());
+    block = block.title_bottom(Line::from(vec![
+        Span::styled(format!(" {links} {} ", if links == 1 { "conexión" } else { "conexiones" }), faint()),
+        Span::styled(format!("· últimas {wlabel} "), faint()),
+        Span::styled("t", bold(ACCENT)),
+        Span::styled(" cambia ", faint()),
+    ]));
+    let inner = block.inner(left).inner(Margin::new(1, 0));
+    f.render_widget(block, left);
+
+    if g.nodes.is_empty() {
+        empty(
+            f,
+            left,
+            &format!(
+                "No hay sesiones activas ni mensajes entre sesiones en las últimas {wlabel}. \
+                 Cuando una sesión le escriba a otra (SendMessage), aparecerán aquí conectadas."
+            ),
+        );
+        if let Some(r) = right {
+            draw_map_detail(f, app, r, &g, None, now, ms, wlabel);
+        }
+        return;
+    }
+
+    let n = g.nodes.len();
+    let max_chip = (inner.width / 3).clamp(14, 30);
+    let chip_ws: Vec<u16> = g
+        .nodes
+        .iter()
+        .map(|nd| {
+            let sub = util::width(&nd.sub) + if nd.subagents > 0 { 5 } else { 0 };
+            ((util::width(&nd.label).max(sub) + 5) as u16).clamp(12, max_chip).min(inner.width)
+        })
+        .collect();
+    let sizes: Vec<(f64, f64)> = chip_ws.iter().map(|&w| (w as f64, 2.0)).collect();
+    let centers = map_layout(&sizes, inner);
+    let hot_any = g.edges.iter().any(|e| now - e.last_ms < HOT_MS);
+    if hot_any || g.nodes.iter().any(|n| n.status == Status::Busy) {
+        app.needs_tick = true;
+    }
+
+    // Aristas (braille) debajo de las fichas.
+    let (cw, ch) = (inner.width as f64, inner.height as f64);
+    let edge_color = |e: &crate::data::graph::Edge| {
+        let age = now - e.last_ms;
+        let touches = si.is_some_and(|s| e.from == s || e.to == s);
+        let base = if age < HOT_MS {
+            ACCENT
+        } else if age < 15 * 60_000 {
+            ACCENT_DEEP
+        } else if age < 3_600_000 {
+            theme::lerp(ACCENT_DEEP, TEXT_FAINT, 0.5)
+        } else {
+            TEXT_FAINT
+        };
+        if touches { if age < HOT_MS { HIGHLIGHT } else { theme::lerp(base, ACCENT_SOFT, 0.6) } } else { base }
+    };
+    let lines: Vec<CLine> = g
+        .edges
+        .iter()
+        .map(|e| {
+            let (a, b) = (centers[e.from], centers[e.to]);
+            CLine::new(a.0, ch - a.1, b.0, ch - b.1, edge_color(e))
+        })
+        .collect();
+    let canvas = Canvas::default()
+        .x_bounds([0.0, cw])
+        .y_bounds([0.0, ch])
+        .marker(ratatui::symbols::Marker::Braille)
+        .paint(|ctx| {
+            for l in &lines {
+                ctx.draw(l);
+            }
+        });
+    f.render_widget(canvas, inner);
+
+    // Paquetes en movimiento sobre las aristas calientes (del emisor al receptor).
+    for e in g.edges.iter().filter(|e| now - e.last_ms < HOT_MS) {
+        let (a, b) = (centers[e.from], centers[e.to]);
+        for k in 0..2 {
+            let t = ((ms as f64 / 1800.0) + k as f64 * 0.5).fract();
+            let (x, y) = (a.0 + (b.0 - a.0) * t, a.1 + (b.1 - a.1) * t);
+            let (cx, cy) = (inner.x + x.floor() as u16, inner.y + y.floor() as u16);
+            if cx < inner.right() && cy < inner.bottom()
+                && let Some(cell) = f.buffer_mut().cell_mut((cx, cy)) {
+                    cell.set_symbol("●").set_fg(HIGHLIGHT);
+                }
+        }
+    }
+
+    // Fichas.
+    for (i, node) in g.nodes.iter().enumerate() {
+        let (x, y) = centers[i];
+        let cwid = chip_ws[i];
+        let left_x = (inner.x as f64 + x - cwid as f64 / 2.0).round().max(inner.x as f64) as u16;
+        let left_x = left_x.min(inner.right().saturating_sub(cwid));
+        let top = (inner.y as f64 + y - 0.5).round().max(inner.y as f64) as u16;
+        let top = top.min(inner.bottom().saturating_sub(2));
+        let rect = Rect::new(left_x, top, cwid, 2.min(inner.height));
+        let selected = Some(i) == si;
+        let bg = if selected { SURFACE_HI } else { SURFACE };
+        f.render_widget(ratatui::widgets::Clear, rect);
+        f.buffer_mut().set_style(rect, Style::new().bg(bg));
+        let (icon, istyle) = status_icon(node.status, ms);
+        let gutter = if selected { Span::styled("▌", accent()) } else { Span::raw(" ") };
+        let tw = cwid.saturating_sub(4) as usize;
+        let l1 = vec![
+            gutter.clone(),
+            Span::styled(format!("{icon} "), istyle),
+            Span::styled(util::truncate(&node.label, tw), if selected { bold(TEXT) } else { text() }),
+        ];
+        let mut sub = node.sub.clone();
+        if node.subagents > 0 {
+            sub = format!("↳{} · {sub}", node.subagents);
+        }
+        let l2 = vec![gutter, Span::styled(format!("  {}", util::truncate(&sub, tw)), faint())];
+        f.render_widget(Paragraph::new(vec![Line::from(l1), Line::from(l2)]).style(Style::new().bg(bg)), rect);
+        app.hits.push(Hit { list: ListId::MapNodes, rect, idx: Some(i), offset: 0, item_h: 2, count: n });
+    }
+    if g.hidden > 0 {
+        let msg = format!(" +{} sin espacio: t para acotar la ventana ", g.hidden);
+        let mw = util::width(&msg) as u16;
+        if mw < inner.width {
+            f.render_widget(Paragraph::new(Span::styled(msg, faint())), Rect::new(inner.right() - mw, inner.y, mw, 1));
+        }
+    }
+
+    match right {
+        Some(r) => draw_map_detail(f, app, r, &g, si, now, ms, wlabel),
+        None => {
+            if let Some(i) = si {
+                let node = &g.nodes[i];
+                let (icon, istyle) = status_icon(node.status, ms);
+                let line = Line::from(clip(
+                    vec![
+                        Span::styled(format!(" {icon} "), istyle),
+                        Span::styled(node.label.clone(), bold(TEXT)),
+                        Span::styled(format!("  ·  {}  ·  {}", status_word(node.status), node.sub), faint()),
+                    ],
+                    inner.width as usize,
+                ));
+                f.render_widget(Paragraph::new(line), Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_map_detail(f: &mut Frame, app: &App, area: Rect, g: &Graph, si: Option<usize>, now: i64, ms: u128, wlabel: &str) {
+    let block = widgets::panel("Detalle", None, false);
+    let inner = block.inner(area).inner(Margin::new(1, 0));
+    f.render_widget(block, area);
+    let w = inner.width as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    match si {
+        None => {
+            lines.push(Line::from(Span::styled("Sin sesiones que mostrar", bold(TEXT))));
+            lines.push(Line::raw(""));
+            lines.push(Line::from(Span::styled("Aquí verás las sesiones abiertas y los", dim())));
+            lines.push(Line::from(Span::styled("mensajes que se mandan entre ellas.", dim())));
+        }
+        Some(i) => {
+            let node = &g.nodes[i];
+            let (icon, istyle) = status_icon(node.status, ms);
+            lines.push(Line::from(clip(vec![Span::styled(format!("{icon} "), istyle), Span::styled(node.label.clone(), bold(TEXT))], w)));
+            if !node.sub.is_empty() {
+                lines.push(Line::from(Span::styled(util::truncate(&node.sub, w), Style::new().fg(ACCENT_SOFT))));
+            }
+            let mut st = status_word(node.status).to_string();
+            if let Some(l) = node.session_id.as_deref().and_then(|id| app.live.get(id)) {
+                if let Some(wf) = l.waiting_for.as_deref().filter(|_| l.is_waiting()) {
+                    st = format!("{st} ({wf})");
+                }
+                let (surface, _) = theme::entrypoint(&l.entrypoint);
+                if !surface.is_empty() {
+                    st = format!("{st} · {surface}");
+                }
+                st = format!("{st} · pid {}", l.pid);
+            }
+            lines.push(Line::from(Span::styled(util::truncate(&st, w), dim())));
+            if node.subagents > 0 {
+                let s = if node.subagents == 1 { "subagente trabajando" } else { "subagentes trabajando" };
+                lines.push(Line::from(Span::styled(format!("↳ {} {s}", node.subagents), Style::new().fg(VIOLET))));
+            }
+            if node.last_ms > 0 {
+                lines.push(Line::from(Span::styled(format!("última actividad {}", util::relative_time(node.last_ms, now)), faint())));
+            }
+            lines.push(Line::raw(""));
+            let mut mine: Vec<&crate::data::graph::Edge> = g.edges.iter().filter(|e| e.from == i || e.to == i).collect();
+            mine.sort_by_key(|e| std::cmp::Reverse(e.last_ms));
+            let total: u32 = mine.iter().map(|e| e.count).sum();
+            lines.push(Line::from(vec![
+                Span::styled("Conexiones", bold(TEXT_DIM)),
+                Span::styled(format!("  {} · {total} mensajes · {wlabel}", mine.len()), faint()),
+            ]));
+            if mine.is_empty() {
+                lines.push(Line::from(Span::styled("sin mensajes con otras sesiones", faint())));
+            }
+            let room = (inner.height as usize).saturating_sub(lines.len() + 5);
+            for e in mine.iter().take(room.max(1)) {
+                let out = e.from == i;
+                let other = &g.nodes[if out { e.to } else { e.from }];
+                let hot = now - e.last_ms < HOT_MS;
+                let arrow = if out { "→ " } else { "← " };
+                let right = format!(" {} · {}", e.count, util::relative_time(e.last_ms, now));
+                let name_w = w.saturating_sub(util::width(&right) + 3);
+                lines.push(split_line(
+                    vec![
+                        Span::styled(arrow, if hot { bold(ACCENT) } else { accent() }),
+                        Span::styled(util::truncate(&other.label, name_w), if hot { bold(TEXT) } else { text() }),
+                    ],
+                    vec![Span::styled(right, if hot { Style::new().fg(ACCENT) } else { faint() })],
+                    w,
+                ));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines), inner);
+
+    // Leyenda al pie.
+    if inner.height >= 6 {
+        let legend = vec![
+            Line::from(vec![
+                Span::styled("✳", bold(AMBER)),
+                Span::styled(" trabajando  ", faint()),
+                Span::styled("◐", bold(AMBER)),
+                Span::styled(" espera  ", faint()),
+                Span::styled("●", Style::new().fg(GREEN)),
+                Span::styled(" inactiva", faint()),
+            ]),
+            Line::from(vec![
+                Span::styled("○", faint()),
+                Span::styled(" cerrada  ", faint()),
+                Span::styled("◇", Style::new().fg(BLUE)),
+                Span::styled(" otra máquina  ", faint()),
+                Span::styled("↳", Style::new().fg(VIOLET)),
+                Span::styled(" subagentes", faint()),
+            ]),
+            Line::from(vec![
+                Span::styled("●⠒⠒", bold(ACCENT)),
+                Span::styled(" mensaje hace < 2 min, va del emisor al receptor", faint()),
+            ]),
+        ];
+        f.render_widget(Paragraph::new(legend), Rect::new(inner.x, inner.bottom() - 3, inner.width, 3));
+    }
+}
+
 // ---------------------------------------------------------------- modales
 
 fn draw_modal(f: &mut Frame, app: &mut App, area: Rect) {
@@ -972,14 +1330,14 @@ fn draw_confirm(f: &mut Frame, area: Rect, m: &ConfirmModal) -> Rect {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) -> Rect {
-    let rect = widgets::centered(area, 74, 29);
+    let rect = widgets::centered(area, 74, 30);
     let title = Line::from(vec![Span::styled(" ? ", bold(ACCENT)), Span::styled("Atajos ", bold(TEXT))]);
     let inner = widgets::modal_frame(f, rect, title, ACCENT);
     let groups: [(&str, &[(&str, &str)]); 4] = [
         ("Navegar", &[("↑↓ j k", "mover"), ("⇥ ←→ 1 2 3", "cambiar de panel"), ("⏎", "abrir / entrar"), ("esc", "volver"), ("/", "filtrar (⏎ abre)"), ("ratón", "click, doble click, rueda")]),
         ("Sesiones", &[("o", "opciones: destino, shell, fork, modelo, permisos"), ("r  F5", "reescanear repos y sesiones")]),
         ("Sets", &[("n", "nuevo set"), ("e", "editar"), ("d", "borrar / quitar entrada"), ("a", "añadir sesión"), ("⇧↑↓", "reordenar")]),
-        ("Global", &[("B", "bypass global de permisos (settings.json)"), ("q  ctrl+c", "salir")]),
+        ("Global", &[("m", "mapa: cómo se comunican las sesiones"), ("B", "bypass global de permisos (settings.json)"), ("q  ctrl+c", "salir")]),
     ];
     let mut lines = Vec::new();
     for (g, keys) in groups {

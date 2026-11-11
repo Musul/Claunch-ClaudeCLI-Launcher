@@ -1,5 +1,6 @@
 //! Catálogo de repos y sesiones, y el hilo que lo mantiene al día.
 
+pub mod graph;
 pub mod live;
 pub mod repos;
 pub mod sessions;
@@ -20,6 +21,10 @@ pub use live::LiveSession;
 pub use repos::RootKind;
 pub use sessions::SessionMeta;
 pub use usage::UsageState;
+
+/// `uds:<tubería>` / `bridge:<id>` → id de sesión local, aprendido de las
+/// sesiones vivas (sirve para reconocer remitentes ya cerrados).
+pub type Aliases = HashMap<String, String>;
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -139,13 +144,16 @@ impl Catalog {
 
 // ---------------------------------------------------------------- índice en disco
 
-const INDEX_VERSION: u32 = 1;
+// 2: añade `links` (mensajes entre sesiones) y `aliases`; obliga a reindexar.
+const INDEX_VERSION: u32 = 2;
 
 #[derive(Serialize, Deserialize, Default)]
 struct IndexFile {
     version: u32,
     sessions: Vec<SessionMeta>,
     roots: Vec<PathBuf>,
+    #[serde(default)]
+    aliases: Aliases,
 }
 
 fn index_path() -> PathBuf {
@@ -164,8 +172,8 @@ fn load_index() -> IndexFile {
     }
 }
 
-fn save_index(sessions: &[SessionMeta], roots: &[PathBuf]) {
-    let file = IndexFile { version: INDEX_VERSION, sessions: sessions.to_vec(), roots: roots.to_vec() };
+fn save_index(sessions: &[SessionMeta], roots: &[PathBuf], aliases: &Aliases) {
+    let file = IndexFile { version: INDEX_VERSION, sessions: sessions.to_vec(), roots: roots.to_vec(), aliases: aliases.clone() };
     let result = serde_json::to_vec(&file).map_err(anyhow::Error::from).and_then(|b| crate::util::write_atomic(&index_path(), &b));
     if let Err(e) = result {
         crate::warn_log!("no se pudo guardar el índice: {e}");
@@ -188,6 +196,7 @@ pub enum WorkerMsg {
     Progress { done: usize, total: usize },
     Catalog(Arc<Catalog>),
     Live(Arc<HashMap<String, LiveSession>>),
+    Aliases(Arc<Aliases>),
     Usage(UsageState),
 }
 
@@ -200,6 +209,7 @@ struct State {
     cfg: ScanConfig,
     metas: HashMap<PathBuf, SessionMeta>,
     roots: Vec<PathBuf>,
+    aliases: Aliases,
     /// Última escritura del índice; con sesiones activas cambia cada pocos segundos.
     saved_at: Option<Instant>,
 }
@@ -251,11 +261,52 @@ impl State {
         let metas: Vec<SessionMeta> = self.metas.values().cloned().collect();
         let catalog = Catalog::build(&metas, &self.roots);
         if force_save || self.saved_at.is_none_or(|t| t.elapsed() >= SAVE_EVERY) {
-            save_index(&metas, &self.roots);
+            save_index(&metas, &self.roots, &self.aliases);
             self.saved_at = Some(Instant::now());
         }
         tx.send(WorkerMsg::Catalog(Arc::new(catalog))).is_ok()
     }
+
+    /// Sesiones vivas con sus subagentes activos; aprende alias nuevos.
+    fn scan_live(&mut self) -> (HashMap<String, LiveSession>, bool) {
+        let mut live = live::scan(&self.cfg.claude_home);
+        let mut learned = false;
+        for l in live.values_mut() {
+            for alias in [l.socket.as_ref().map(|s| format!("uds:{s}")), l.bridge_id.as_ref().map(|b| format!("bridge:{b}"))]
+                .into_iter()
+                .flatten()
+            {
+                if self.aliases.get(&alias) != Some(&l.session_id) {
+                    self.aliases.insert(alias, l.session_id.clone());
+                    learned = true;
+                }
+            }
+            let file = self.metas.values().find(|m| m.id == l.session_id).map(|m| m.file.clone());
+            l.subagents = file.map(|f| active_subagents(&f)).unwrap_or(0);
+        }
+        (live, learned)
+    }
+}
+
+/// Subagente activo: su `.jsonl` cambió hace menos de esto.
+const SUBAGENT_ACTIVE: Duration = Duration::from_secs(120);
+
+/// Cuenta `<sesión>/subagents/*.jsonl` modificados hace poco.
+fn active_subagents(session_file: &Path) -> usize {
+    let dir = session_file.with_extension("").join("subagents");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return 0 };
+    let now = std::time::SystemTime::now();
+    entries
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
+        .filter(|e| {
+            e.metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age < SUBAGENT_ACTIVE)
+        })
+        .count()
 }
 
 pub fn spawn_worker(cfg: ScanConfig) -> (Receiver<WorkerMsg>, Sender<WorkerCmd>) {
@@ -278,11 +329,13 @@ fn worker(cfg: ScanConfig, tx: Sender<WorkerMsg>, cmds: Receiver<WorkerCmd>) {
     let mut st = State {
         metas: cached.sessions.into_iter().map(|m| (m.file.clone(), m)).collect(),
         roots: cached.roots,
+        aliases: cached.aliases,
         cfg,
         saved_at: None,
     };
-    let mut last_live: HashMap<String, LiveSession> = live::scan(&st.cfg.claude_home);
+    let (mut last_live, _) = st.scan_live();
     let _ = tx.send(WorkerMsg::Live(Arc::new(last_live.clone())));
+    let _ = tx.send(WorkerMsg::Aliases(Arc::new(st.aliases.clone())));
     if !st.metas.is_empty() || !st.roots.is_empty() {
         let metas: Vec<SessionMeta> = st.metas.values().cloned().collect();
         let _ = tx.send(WorkerMsg::Catalog(Arc::new(Catalog::build(&metas, &st.roots))));
@@ -310,7 +363,10 @@ fn worker(cfg: ScanConfig, tx: Sender<WorkerMsg>, cmds: Receiver<WorkerCmd>) {
             Err(RecvTimeoutError::Timeout) => {}
         }
         tick = tick.wrapping_add(1);
-        let live = live::scan(&st.cfg.claude_home);
+        let (live, learned) = st.scan_live();
+        if learned && tx.send(WorkerMsg::Aliases(Arc::new(st.aliases.clone()))).is_err() {
+            return;
+        }
         if live != last_live {
             last_live = live.clone();
             if tx.send(WorkerMsg::Live(Arc::new(live))).is_err() {
