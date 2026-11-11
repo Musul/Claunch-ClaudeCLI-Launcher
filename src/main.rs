@@ -21,6 +21,7 @@ uso:
   claunch bypass [status|on|off] [--yes]
                                 bypass global de permisos (~/.claude/settings.json)
   claunch usage [--json]        uso del plan de Claude (ventanas de 5 h y 7 días)
+  claunch demo                  la interfaz con datos de ejemplo (para mostrarla)
   claunch setup [--uninstall]   instala en ~/.local/bin y añade perfiles a Windows Terminal
   claunch --version
 
@@ -39,6 +40,7 @@ fn main() -> ExitCode {
         Some("open") => open_set(rest),
         Some("usage") => data::usage::cli(rest),
         Some("snapshot") => report(ui::snapshot(rest)),
+        Some("demo") => report(ui::run_demo()),
         Some("-h" | "--help" | "help") => {
             print!("{HELP}");
             ExitCode::SUCCESS

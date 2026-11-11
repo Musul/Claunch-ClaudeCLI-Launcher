@@ -369,6 +369,9 @@ pub struct App {
     bypass_checked: Instant,
     /// Sin escrituras en config (modo snapshot).
     pub read_only: bool,
+    /// Datos de ejemplo (`claunch demo`): nada se lanza ni se escribe.
+    pub demo: bool,
+    demo_epoch: u64,
     /// Si es `Some`, los lanzamientos se registran aquí en vez de ejecutarse (tests).
     pub dry_run: Option<Vec<(Vec<LaunchItem>, Placement, bool)>>,
 }
@@ -411,6 +414,8 @@ impl App {
             bypass: claude_settings::status().map_err(|e| format!("{e:#}")),
             bypass_checked: Instant::now(),
             read_only: false,
+            demo: false,
+            demo_epoch: 0,
             dry_run: None,
             cfg,
         };
@@ -649,6 +654,15 @@ impl App {
             self.last_poll = now;
             self.poll_batches();
         }
+        // Demo: renueva los datos para que los mensajes «en vivo» sigan frescos.
+        if self.demo {
+            let epoch = self.started.elapsed().as_secs() / 30;
+            if epoch != self.demo_epoch {
+                self.demo_epoch = epoch;
+                super::demo::refresh(self);
+            }
+            return;
+        }
         // settings.json puede cambiar fuera (Claude, VS Code, a mano).
         if now.duration_since(self.bypass_checked) >= Duration::from_secs(3) {
             self.bypass_checked = now;
@@ -657,6 +671,10 @@ impl App {
     }
 
     fn ask_bypass(&mut self) {
+        if self.demo {
+            self.toast(ToastKind::Info, "Modo demo: el bypass global no se toca");
+            return;
+        }
         match &self.bypass {
             Ok(s) if s.enabled => self.open_modal(Modal::Confirm(ConfirmModal {
                 message: "¿Desactivar el bypass global de permisos?".into(),
@@ -894,6 +912,10 @@ impl App {
     }
 
     fn refresh(&mut self) {
+        if self.demo {
+            self.toast(ToastKind::Info, "Modo demo: datos de ejemplo");
+            return;
+        }
         if let Some(w) = &self.worker
             && w.send(WorkerCmd::Refresh).is_ok() {
                 self.toast(ToastKind::Info, "Reescaneando repos y sesiones…");
@@ -1635,6 +1657,9 @@ impl App {
             .collect();
         if let Some(log) = &mut self.dry_run {
             log.push((items, req.placement, req.here));
+            if self.demo {
+                self.toast(ToastKind::Info, format!("Modo demo: aquí se abriría {}", req.label));
+            }
             return;
         }
         let env = match &self.env {

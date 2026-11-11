@@ -1,6 +1,7 @@
 //! Bucle de la TUI.
 
 pub mod app;
+pub mod demo;
 mod draw;
 mod fx;
 pub mod theme;
@@ -50,8 +51,19 @@ pub fn run() -> anyhow::Result<()> {
     let (cfg, cfg_error) = Config::load();
     crate::launch::cleanup_launch_dir();
     let (rx, cmd_tx) = data::spawn_worker(scan_config(&cfg));
-    let mut app = App::new(cfg, cfg_error, Some(cmd_tx));
+    let app = App::new(cfg, cfg_error, Some(cmd_tx));
+    run_app(app, &rx)
+}
 
+/// `claunch demo`: la interfaz con datos de ejemplo (sin leer ni escribir nada real).
+pub fn run_demo() -> anyhow::Result<()> {
+    let (_tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+    let mut app = demo::app();
+    app.toast(app::ToastKind::Info, "Modo demo: datos de ejemplo, no se abre ni se guarda nada");
+    run_app(app, &rx)
+}
+
+fn run_app(mut app: App, rx: &std::sync::mpsc::Receiver<WorkerMsg>) -> anyhow::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         leave();
@@ -60,7 +72,7 @@ pub fn run() -> anyhow::Result<()> {
     enter()?;
     let mut terminal: Term = Terminal::new(CrosstermBackend::new(stdout())).context("no se pudo iniciar la terminal")?;
     terminal.clear()?;
-    let result = event_loop(&mut terminal, &mut app, &rx);
+    let result = event_loop(&mut terminal, &mut app, rx);
     leave();
     result
 }
@@ -143,10 +155,13 @@ fn run_here(terminal: &mut Term, app: &mut App, item: crate::launch::LaunchItem)
 
 // ---------------------------------------------------------------- snapshot
 
-/// `claunch snapshot <pantalla> <ancho>x<alto> <salida.html>`: renderiza con
-/// datos reales a HTML para revisar el diseño en un navegador (desarrollo).
+/// `claunch snapshot <pantalla> <ancho>x<alto> <salida.html> [--demo]`: renderiza
+/// con datos reales (o de ejemplo con `--demo`) a HTML para revisar el diseño en
+/// un navegador o sacar capturas.
 pub fn snapshot(args: &[String]) -> anyhow::Result<()> {
     use ratatui::backend::TestBackend;
+    let demo = args.iter().any(|a| a == "--demo");
+    let args: Vec<String> = args.iter().filter(|a| *a != "--demo").cloned().collect();
     let screen = args.first().map(String::as_str).unwrap_or("home");
     let (w, h) = args
         .get(1)
@@ -155,8 +170,15 @@ pub fn snapshot(args: &[String]) -> anyhow::Result<()> {
         .unwrap_or((140u16, 40u16));
     let out = args.get(2).cloned().unwrap_or_else(|| "snapshot.html".into());
 
-    let (cfg, cfg_error) = Config::load();
-    let mut app = load_blocking(cfg, cfg_error, true)?;
+    let mut app = if demo {
+        demo::app()
+    } else {
+        let (cfg, cfg_error) = Config::load();
+        load_blocking(cfg, cfg_error, true)?
+    };
+    app.fx.enabled = false;
+    // Fotograma «✳» del spinner (con 0 ms sería «·», que no se lee como actividad).
+    app.started = Instant::now().checked_sub(Duration::from_millis(250)).unwrap_or(app.started);
     app.toasts.clear();
     app.apply_snapshot_script(screen);
     let mut terminal = Terminal::new(TestBackend::new(w, h))?;
