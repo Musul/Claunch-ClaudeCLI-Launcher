@@ -1,0 +1,37 @@
+name: release
+
+# Publica claunch-windows-x64.zip (+ .sha256) al empujar una etiqueta vX.Y.Z.
+# install.ps1 descarga siempre la última release publicada.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: La etiqueta coincide con Cargo.toml
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne $env:GITHUB_REF_NAME) { throw "La etiqueta $env:GITHUB_REF_NAME no coincide con Cargo.toml (v$v)" }
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Empaquetar
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Compress-Archive -Path target/release/claunch.exe -DestinationPath dist/claunch-windows-x64.zip
+          $h = (Get-FileHash dist/claunch-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+          "$h  claunch-windows-x64.zip" | Out-File -Encoding ascii dist/claunch-windows-x64.zip.sha256
+          Get-Content dist/claunch-windows-x64.zip.sha256
+      - name: Publicar release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create $env:GITHUB_REF_NAME dist/claunch-windows-x64.zip dist/claunch-windows-x64.zip.sha256 --title "claunch $env:GITHUB_REF_NAME" --generate-notes
