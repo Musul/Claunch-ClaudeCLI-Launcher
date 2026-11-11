@@ -30,16 +30,9 @@ El instalador:
 3. Lo copia a `%USERPROFILE%\.local\bin`, lo añade a tu PATH y crea los perfiles
    «claunch» y «Claude · Git Bash» en Windows Terminal.
 
-> **Mientras el repo sea privado** el comando de arriba no es accesible sin
-> sesión. Con [GitHub CLI](https://cli.github.com) y una cuenta con acceso
-> (`gh auth login`):
->
-> ```powershell
-> gh api repos/Musul/Claunch-ClaudeCLI-Launcher/contents/install.ps1 -H "Accept: application/vnd.github.raw" | Out-String | iex
-> ```
->
-> El instalador descarga entonces la versión con `gh`. Sin release accesible
-> compila con `cargo`; desde un clon: `powershell -ExecutionPolicy Bypass -File .\install.ps1`.
+> ¿Prefieres compilarlo tú? Desde un clon:
+> `powershell -ExecutionPolicy Bypass -File .\install.ps1` (usa la release
+> publicada o, con `CLAUNCH_FROM_SOURCE=1`, compila con `cargo`).
 
 Opciones (variables de entorno): `CLAUNCH_VERSION=v0.2.0` (versión concreta),
 `CLAUNCH_FROM_SOURCE=1` (compilar), `CLAUNCH_YES=1` (sin preguntas),
