@@ -9,12 +9,14 @@ on:
 permissions:
   contents: write
 
+# Solo acciones de GitHub (actions/*): la organización puede bloquear las de terceros.
 jobs:
   release:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust estable (rustup ya viene en el runner)
+        run: rustup toolchain install stable --profile minimal && rustup default stable
       - name: La etiqueta coincide con Cargo.toml
         shell: pwsh
         run: |

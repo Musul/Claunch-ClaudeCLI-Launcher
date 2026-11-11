@@ -5,13 +5,22 @@ on:
     branches: [main]
   pull_request:
 
+# Solo acciones de GitHub (actions/*): la organización puede bloquear las de terceros.
 jobs:
   test:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - name: Rust estable (rustup ya viene en el runner)
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
       - run: cargo test --locked
       - name: Instalador (sintaxis PowerShell 5.1)
         shell: powershell
