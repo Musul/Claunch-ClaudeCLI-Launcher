@@ -218,9 +218,9 @@ ensure_path() {
     esac
     # shellcheck disable=SC2016 # se escribe literal: lo expande la shell al abrirse
     line='export PATH="$HOME/.local/bin:$PATH"'
-    case ${SHELL##*/} in
-        bash) rc="$HOME/.bashrc" ;;
-        zsh) rc="${ZDOTDIR:-$HOME}/.zshrc" ;;
+    case ${SHELL:-} in
+        bash | */bash) rc="$HOME/.bashrc" ;;
+        zsh | */zsh) rc="${ZDOTDIR:-$HOME}/.zshrc" ;;
         *) rc='' ;;
     esac
     if [ -n "$rc" ] && grep -qs '\.local/bin' "$rc"; then
