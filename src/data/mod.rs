@@ -221,6 +221,11 @@ impl State {
     fn reindex(&mut self, tx: &Sender<WorkerMsg>, report: bool) -> bool {
         let files = sessions::list_session_files(&self.cfg.claude_home.join("projects"));
         let total = files.len();
+        // Sin sesiones (instalación nueva) el bucle no avisa nunca: quien espera
+        // el progreso (`claunch open`, `snapshot`) se quedaría bloqueado 2 min.
+        if report && total == 0 {
+            let _ = tx.send(WorkerMsg::Progress { done: 0, total: 0 });
+        }
         let done = AtomicUsize::new(0);
         let last_report = std::sync::Mutex::new(Instant::now());
         let results: Vec<(PathBuf, Option<SessionMeta>)> = files
@@ -376,5 +381,23 @@ fn worker(cfg: ScanConfig, tx: Sender<WorkerMsg>, cmds: Receiver<WorkerCmd>) {
         if tick.is_multiple_of(2) && st.reindex(&tx, false) && !st.publish(&tx, false) {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Sin ninguna sesión también hay aviso de progreso: `claunch open` y
+    /// `snapshot` lo esperan antes de usar el catálogo.
+    #[test]
+    fn empty_projects_still_reports_progress() {
+        let home = std::env::temp_dir().join("claunch-tests").join("empty-home");
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        let cfg = ScanConfig { claude_home: home, roots: Vec::new(), depth: 0, exclude: Vec::new(), usage: false };
+        let mut st = State { cfg, metas: HashMap::new(), roots: Vec::new(), aliases: Aliases::new(), saved_at: None };
+        let (tx, rx) = mpsc::channel();
+        st.reindex(&tx, true);
+        assert!(matches!(rx.try_recv(), Ok(WorkerMsg::Progress { done: 0, total: 0 })));
     }
 }
