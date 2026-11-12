@@ -1,6 +1,6 @@
 [package]
 name = "claunch"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Launcher TUI para repos y sesiones de Claude Code en Windows (Windows Terminal + Git Bash) y Linux (tmux o emulador gráfico)"
 license = "MIT"
