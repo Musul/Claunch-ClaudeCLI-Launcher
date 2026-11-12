@@ -270,6 +270,9 @@ Con `--demo` usa los datos de ejemplo; así se generan las capturas de
    `.sha256`. Si uno falla no se publica nada. Desde ese momento los comandos de
    instalación descargan esa versión.
 
+Para ensayar sin publicar (p. ej. tras tocar `release.yml`): Actions → release →
+*Run workflow*. Compila, empaqueta y verifica los SHA-256, pero no crea la release.
+
 ### Archivos
 
 - `src/data/`: índice de sesiones, repos, sesiones vivas, uso del plan (`usage.rs`) y grafo (`graph.rs`).
