@@ -16,7 +16,7 @@ use crate::config::{Config, LaunchOptions, SessionRef, SessionSet, SetEntry, Set
 use crate::data::sessions::PeerLink;
 use crate::data::usage::{Limit, Usage};
 use crate::data::{Aliases, Catalog, LiveSession, RootKind, Repo, Session, SessionMeta, UsageState};
-use crate::launch::Env;
+use crate::launch::{Env, Terminal};
 use crate::paths;
 
 const MIN: i64 = 60_000;
@@ -281,7 +281,7 @@ pub fn app() -> App {
     app.env = Ok(Env {
         claude: vec!["claude".into()],
         git_bash: None,
-        wt: None,
+        terminal: Terminal::Unavailable,
         self_exe: std::env::current_exe().unwrap_or_default(),
         general,
     });

@@ -3,6 +3,8 @@
 //! Claude Code (CLI, VS Code y Desktop) registra ahí cada proceso. Un archivo
 //! puede quedar huérfano si el proceso murió, así que se valida que el pid siga
 //! vivo y que su hora de creación coincida con `procStart` (evita pids reciclados).
+//! `procStart` es un FILETIME en Windows y, en Linux, la salida de
+//! `ps -o lstart= -p <pid>` en UTC (`Wed Nov 11 15:59:02 2026`).
 //! Los archivos `.key` de esa carpeta son secretos: nunca se abren.
 
 use std::collections::HashMap;
@@ -22,7 +24,8 @@ pub struct LiveSession {
     pub waiting_for: Option<String>,
     pub name: Option<String>,
     pub started_ms: i64,
-    /// Tubería de mensajería entre sesiones (`\\.\pipe\LOCAL\cc-msg-…`).
+    /// Canal de mensajería entre sesiones: tubería `\\.\pipe\LOCAL\cc-msg-…` en
+    /// Windows, socket Unix en Linux.
     pub socket: Option<String>,
     /// Id de Remote Control (`session_…`) si la sesión está enlazada.
     pub bridge_id: Option<String>,
@@ -86,8 +89,7 @@ pub fn scan(claude_home: &Path) -> HashMap<String, LiveSession> {
                 continue;
             }
         };
-        let start = raw.proc_start.as_deref().and_then(|s| s.parse::<u64>().ok());
-        if !process_alive(raw.pid, start) {
+        if !process_alive(raw.pid, raw.proc_start.as_deref()) {
             continue;
         }
         out.insert(
@@ -110,13 +112,14 @@ pub fn scan(claude_home: &Path) -> HashMap<String, LiveSession> {
     out
 }
 
-/// `true` si el proceso existe y (si se conoce) nació en `created` (FILETIME).
+/// `true` si el proceso existe y (si se conoce) nació en `proc_start` (FILETIME).
 #[cfg(windows)]
-pub fn process_alive(pid: u32, created: Option<u64>) -> bool {
+pub fn process_alive(pid: u32, proc_start: Option<&str>) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
+    let created = proc_start.and_then(|s| s.parse::<u64>().ok());
     // SAFETY: llamadas Win32 con handle propio que se cierra siempre.
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -141,7 +144,111 @@ pub fn process_alive(pid: u32, created: Option<u64>) -> bool {
     }
 }
 
-#[cfg(not(windows))]
-pub fn process_alive(_pid: u32, _created: Option<u64>) -> bool {
+/// `true` si el proceso existe, no es zombi y (si se conoce) nació en
+/// `proc_start` (`ps -o lstart=` en UTC). Lee `/proc`, sin lanzar procesos.
+#[cfg(target_os = "linux")]
+pub fn process_alive(pid: u32, proc_start: Option<&str>) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
+    let Some((state, start_ticks)) = parse_stat(&stat) else {
+        crate::warn_log!("/proc/{pid}/stat ilegible");
+        return false;
+    };
+    if matches!(state, 'Z' | 'X' | 'x') {
+        return false;
+    }
+    let Some(expected) = proc_start.and_then(parse_lstart) else { return true };
+    match (boot_time_secs(), clock_ticks()) {
+        // `ps` calcula lstart igual: arranque del sistema + ticks / CLK_TCK.
+        (Some(btime), Some(hz)) => (btime + (start_ticks / hz) as i64).abs_diff(expected) <= 2,
+        // Sin hora de arranque no se puede descartar un pid reciclado: se da por vivo.
+        _ => {
+            crate::warn_log!("no se pudo leer la hora de arranque del sistema; pid {pid} sin verificar");
+            true
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn process_alive(_pid: u32, _proc_start: Option<&str>) -> bool {
     false
+}
+
+/// Estado y `starttime` (ticks desde el arranque) de `/proc/<pid>/stat`.
+/// El nombre del proceso va entre paréntesis y puede contener espacios.
+#[cfg(any(target_os = "linux", test))]
+fn parse_stat(stat: &str) -> Option<(char, u64)> {
+    let after = &stat[stat.rfind(')')? + 1..];
+    let mut fields = after.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // `starttime` es el campo 22; tras el nombre empieza el 3 (estado).
+    let start = fields.nth(22 - 4)?.parse().ok()?;
+    Some((state, start))
+}
+
+/// `Wed Nov 11 15:59:02 2026` (UTC) → segundos Unix.
+#[cfg(any(target_os = "linux", test))]
+fn parse_lstart(s: &str) -> Option<i64> {
+    const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    let [_, mon, day, hms, year] = parts.as_slice() else { return None };
+    let month = MONTHS.iter().position(|m| m == mon)? as i8 + 1;
+    let mut t = hms.split(':').map(|x| x.parse::<i8>().ok());
+    let (h, m, sec) = (t.next()??, t.next()??, t.next()??);
+    let dt = jiff::civil::DateTime::new(year.parse().ok()?, month, day.parse().ok()?, h, m, sec, 0).ok()?;
+    Some(dt.to_zoned(jiff::tz::TimeZone::UTC).ok()?.timestamp().as_second())
+}
+
+#[cfg(target_os = "linux")]
+fn boot_time_secs() -> Option<i64> {
+    static BTIME: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
+    *BTIME.get_or_init(|| {
+        let text = std::fs::read_to_string("/proc/stat").ok()?;
+        text.lines().find_map(|l| l.strip_prefix("btime "))?.trim().parse().ok()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn clock_ticks() -> Option<u64> {
+    // SAFETY: sysconf solo consulta una constante del sistema.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    u64::try_from(hz).ok().filter(|h| *h > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_proc_stat() {
+        let stat = "4242 (node (claude) x) S 1 4242 4242 34816 4242 4194304 1 0 0 0 5 2 0 0 20 0 11 0 987654 0 0";
+        assert_eq!(parse_stat(stat), Some(('S', 987654)));
+        assert_eq!(parse_stat("1 (x) Z"), None);
+    }
+
+    #[test]
+    fn parses_ps_lstart() {
+        // 2026-11-11T15:59:02Z
+        assert_eq!(parse_lstart("Wed Nov 11 15:59:02 2026"), Some(1_794_412_742));
+        assert_eq!(parse_lstart("Sun Mar  1 09:05:00 2026"), Some(1_772_355_900));
+        assert_eq!(parse_lstart("134388807592906634"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn own_process_is_alive() {
+        let me = std::process::id();
+        assert!(process_alive(me, None));
+        // Lo mismo que escribe Claude Code: `ps -o lstart= -p <pid>` en UTC.
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-o", "lstart=", "-p", &me.to_string()])
+            .env("LC_ALL", "C")
+            .env("TZ", "UTC")
+            .output()
+        {
+            let lstart = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            assert!(process_alive(me, Some(&lstart)), "lstart {lstart:?}");
+            assert!(!process_alive(me, Some("Thu Jan  1 00:00:00 2015")));
+        }
+        assert!(!process_alive(u32::MAX - 1, None));
+    }
 }

@@ -96,10 +96,12 @@ fn linked_worktree(git_file: &Path) -> Option<(PathBuf, String)> {
     }
     let norm = paths::normalize(&gitdir);
     let s = norm.to_string_lossy();
-    let lower = s.to_lowercase();
-    let idx = lower.rfind(r"\.git\worktrees\")?;
+    // En Windows `.GIT\Worktrees` también vale (no distingue mayúsculas).
+    let hay = if cfg!(windows) { s.to_lowercase() } else { s.to_string() };
+    let marker = format!("{sep}.git{sep}worktrees{sep}", sep = paths::SEP);
+    let idx = hay.rfind(&marker)?;
     let main = PathBuf::from(&s[..idx]);
-    let name = s[idx + r"\.git\worktrees\".len()..].to_string();
+    let name = s[idx + marker.len()..].to_string();
     Some((main, name))
 }
 
@@ -147,7 +149,7 @@ fn place(cwd: &str, known: &[(String, PathBuf)]) -> Placement {
     // La carpeta ya no existe: se asocia al repo conocido más profundo que la contenga.
     let key = paths::key(&cwd_path);
     for (k, root) in known {
-        if key == *k || key.starts_with(&format!("{k}\\")) {
+        if paths::key_within(&key, k) {
             return Placement { root: root.clone(), kind: RootKind::Git, subpath: rel(&cwd_path, root), worktree: None };
         }
     }
@@ -162,7 +164,7 @@ fn rel(path: &Path, root: &Path) -> Option<String> {
     }
     let full = paths::normalize(path);
     let s = full.to_string_lossy();
-    (p.starts_with(&r) && s.len() > r.len() + 1).then(|| s[r.len() + 1..].to_string())
+    (paths::key_within(&p, &r) && s.len() > r.len() + 1).then(|| s[r.len() + 1..].to_string())
 }
 
 /// Última actividad git (ms): el más reciente entre HEAD, index, logs/HEAD y FETCH_HEAD.
@@ -175,7 +177,7 @@ pub fn git_activity_ms(root: &Path) -> Option<i64> {
         let d = PathBuf::from(text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim());
         if d.is_relative() { root.join(d) } else { d }
     };
-    ["HEAD", "index", r"logs\HEAD", "FETCH_HEAD"]
+    ["HEAD", "index", "logs/HEAD", "FETCH_HEAD"]
         .iter()
         .filter_map(|f| std::fs::metadata(gitdir.join(f)).ok()?.modified().ok())
         .filter_map(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -198,12 +200,13 @@ mod tests {
         let known = scan_roots(std::slice::from_ref(&base), 3, &[]);
         assert!(known.iter().any(|k| paths::key(k) == paths::key(&repo)));
 
-        let sub_s = sub.to_string_lossy().to_uppercase();
+        // Windows no distingue mayúsculas: la sesión puede traer otra grafía.
+        let sub_s = if cfg!(windows) { sub.to_string_lossy().to_uppercase() } else { sub.to_string_lossy().into_owned() };
         let missing = repo.join("borrada").to_string_lossy().into_owned();
         let placed = place_all(&[sub_s.clone(), missing.clone()], &known);
         let a = &placed[&paths::key(Path::new(&sub_s))];
         assert_eq!(paths::key(&a.root), paths::key(&repo));
-        assert_eq!(a.subpath.as_deref().map(str::to_lowercase), Some(r"apps\harness".to_string()));
+        assert_eq!(a.subpath.as_deref().map(str::to_lowercase), Some(format!("apps{}harness", paths::SEP)));
         let b = &placed[&paths::key(Path::new(&missing))];
         assert_eq!(paths::key(&b.root), paths::key(&repo));
         assert_eq!(b.kind, RootKind::Git);

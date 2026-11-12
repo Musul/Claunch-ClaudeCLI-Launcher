@@ -48,8 +48,13 @@ fn default_mode(v: &Value) -> Option<String> {
 
 fn policy_blocks() -> bool {
     let mut candidates = vec![paths::claude_home().join("remote-settings.json")];
-    candidates.push(PathBuf::from(r"C:\Program Files\ClaudeCode\managed-settings.json"));
-    candidates.push(PathBuf::from(r"C:\ProgramData\ClaudeCode\managed-settings.json"));
+    #[cfg(windows)]
+    candidates.extend([
+        PathBuf::from(r"C:\Program Files\ClaudeCode\managed-settings.json"),
+        PathBuf::from(r"C:\ProgramData\ClaudeCode\managed-settings.json"),
+    ]);
+    #[cfg(target_os = "linux")]
+    candidates.push(PathBuf::from("/etc/claude-code/managed-settings.json"));
     candidates.iter().any(|p| {
         read_json(p)
             .ok()

@@ -94,7 +94,10 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         }
         _ if !app.loaded => vec![Span::styled(format!("  {} cargando…", widgets::spinner(ms)), accent())],
         _ => match (&app.env, &app.cfg_error) {
-            (Err(_), _) => vec![Span::styled("  ⚠ falta claude o Git Bash", bold(RED))],
+            (Err(_), _) => vec![Span::styled(
+                if cfg!(windows) { "  ⚠ falta claude o Git Bash" } else { "  ⚠ no encuentro claude" },
+                bold(RED),
+            )],
             (_, Some(_)) => vec![Span::styled("  ⚠ config.toml inválido", bold(AMBER))],
             _ => vec![Span::styled(concat!("  Claude Code launcher v", env!("CARGO_PKG_VERSION")), faint())],
         },
@@ -709,7 +712,11 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect, set: usize, row: usize,
                         format!("{}{}", &id[..id.len().min(8)], if ok { "" } else { " ⚠ no encontrada" })
                     }
                 };
-                let mut meta = vec![what, e.options.shell.unwrap_or(app.cfg.general.default_shell).label().to_string()];
+                let mut meta = vec![what];
+                // La shell solo se elige en Windows.
+                if cfg!(windows) {
+                    meta.push(e.options.shell.unwrap_or(app.cfg.general.default_shell).label().to_string());
+                }
                 if let Some(m) = &e.options.model {
                     meta.push(m.clone());
                 }
@@ -755,7 +762,7 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect, set: usize, row: usize,
     }
 }
 
-/// Diagrama de cómo quedará el set en Windows Terminal.
+/// Diagrama de cómo quedará el set (Windows Terminal o tmux).
 fn draw_layout_preview(f: &mut Frame, app: &App, area: Rect, s: &crate::config::SessionSet) {
     let block = widgets::panel("Vista previa", None, false);
     let inner = block.inner(area).inner(Margin::new(1, 0));
@@ -772,11 +779,17 @@ fn draw_layout_preview(f: &mut Frame, app: &App, area: Rect, s: &crate::config::
         empty(f, area, "Añade sesiones para ver el diseño");
         return;
     }
-    let caption = match s.layout {
+    let terminal = app.env.as_ref().ok().map(|e| &e.terminal);
+    let mut caption = match s.layout {
         SetLayout::Tabs => format!("{} pestañas en {}", titles.len(), s.window.label().to_lowercase()),
         SetLayout::Panes => format!("{} paneles en una pestaña ({})", titles.len(), s.window.label().to_lowercase()),
-        SetLayout::Windows => format!("{} ventanas de Windows Terminal", titles.len()),
+        SetLayout::Windows if cfg!(windows) => format!("{} ventanas de Windows Terminal", titles.len()),
+        SetLayout::Windows => format!("{} ventanas", titles.len()),
     };
+    // Sin tmux, los emuladores de Linux solo abren ventanas sueltas.
+    if matches!(terminal, Some(launch::Terminal::Emulator(_))) && s.layout != SetLayout::Windows && titles.len() > 1 {
+        caption.push_str(" · sin tmux se abren en ventanas separadas");
+    }
     let [cap, canvas] = Layout::vertical([Constraint::Length(2), Constraint::Fill(1)]).areas(inner);
     f.render_widget(Paragraph::new(Span::styled(caption, faint())), cap);
     let canvas = Rect::new(canvas.x, canvas.y, canvas.width, canvas.height.min(16));
@@ -1335,7 +1348,13 @@ fn draw_help(f: &mut Frame, area: Rect) -> Rect {
     let inner = widgets::modal_frame(f, rect, title, ACCENT);
     let groups: [(&str, &[(&str, &str)]); 4] = [
         ("Navegar", &[("↑↓ j k", "mover"), ("⇥ ←→ 1 2 3", "cambiar de panel"), ("⏎", "abrir / entrar"), ("esc", "volver"), ("/", "filtrar (⏎ abre)"), ("ratón", "click, doble click, rueda")]),
-        ("Sesiones", &[("o", "opciones: destino, shell, fork, modelo, permisos"), ("r  F5", "reescanear repos y sesiones")]),
+        (
+            "Sesiones",
+            &[
+                ("o", if cfg!(windows) { "opciones: destino, shell, fork, modelo, permisos" } else { "opciones: destino, fork, modelo, permisos" }),
+                ("r  F5", "reescanear repos y sesiones"),
+            ],
+        ),
         ("Sets", &[("n", "nuevo set"), ("e", "editar"), ("d", "borrar / quitar entrada"), ("a", "añadir sesión"), ("⇧↑↓", "reordenar")]),
         ("Global", &[("m", "mapa: cómo se comunican las sesiones"), ("B", "bypass global de permisos (settings.json)"), ("q  ctrl+c", "salir")]),
     ];

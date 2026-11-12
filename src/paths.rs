@@ -1,11 +1,19 @@
-//! Rutas del sistema y normalización de rutas de Windows.
+//! Rutas del sistema y normalización de rutas.
 //!
-//! Regla clave: Claude Code compara el `cwd` como texto. La extensión de VS Code
-//! guarda `c:\...` (unidad en minúscula) y la CLI desde Git Bash `C:\...`.
-//! claunch arranca siempre con la unidad en minúscula para que `/resume` vea
-//! las sesiones de ambas superficies (ver docs/diagnostico-resume-mayusculas.md).
+//! Windows. Regla clave: Claude Code compara el `cwd` como texto. La extensión
+//! de VS Code guarda `c:\...` (unidad en minúscula) y la CLI desde Git Bash
+//! `C:\...`. claunch arranca siempre con la unidad en minúscula para que
+//! `/resume` vea las sesiones de ambas superficies (ver
+//! docs/diagnostico-resume-mayusculas.md). Las rutas se comparan sin distinguir
+//! mayúsculas, como el sistema de archivos.
+//!
+//! Linux. Las rutas se usan tal cual (solo sin `/` final) y se comparan
+//! distinguiendo mayúsculas.
 
 use std::path::{Path, PathBuf};
+
+/// Separador de rutas del sistema: `\` en Windows, `/` en Linux.
+pub const SEP: char = std::path::MAIN_SEPARATOR;
 
 /// Carpeta de datos de Claude Code (`CLAUDE_CONFIG_DIR` o `~/.claude`).
 pub fn claude_home() -> PathBuf {
@@ -19,12 +27,14 @@ pub fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// `%APPDATA%\claunch`: configuración y sets (roaming).
+/// Configuración y sets: `%APPDATA%\claunch` (Windows, roaming) o
+/// `~/.config/claunch` (Linux, `XDG_CONFIG_HOME`).
 pub fn config_dir() -> PathBuf {
     dirs::config_dir().unwrap_or_else(home).join("claunch")
 }
 
-/// `%LOCALAPPDATA%\claunch`: índice, log y archivos de arranque.
+/// Índice, log y archivos de arranque: `%LOCALAPPDATA%\claunch` (Windows) o
+/// `~/.local/share/claunch` (Linux, `XDG_DATA_HOME`).
 pub fn data_dir() -> PathBuf {
     dirs::data_local_dir().unwrap_or_else(home).join("claunch")
 }
@@ -50,6 +60,7 @@ pub fn expand(raw: &str) -> PathBuf {
 
 /// Normaliza a la forma con la que claunch arranca Claude:
 /// separadores `\`, sin prefijo `\\?\`, sin `\` final y unidad en minúscula.
+#[cfg(windows)]
 pub fn normalize(path: &Path) -> PathBuf {
     let mut s = path.to_string_lossy().replace('/', "\\");
     if let Some(rest) = s.strip_prefix(r"\\?\") {
@@ -71,12 +82,34 @@ pub fn normalize(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Clave para comparar rutas sin distinguir mayúsculas (como el sistema de archivos).
+/// Normaliza a la forma con la que claunch arranca Claude: sin `/` final.
+#[cfg(not(windows))]
+pub fn normalize(path: &Path) -> PathBuf {
+    let mut s = path.to_string_lossy().into_owned();
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    PathBuf::from(s)
+}
+
+/// Clave para comparar rutas como lo hace el sistema de archivos: sin
+/// distinguir mayúsculas en Windows, distinguiéndolas en Linux.
 pub fn key(path: &Path) -> String {
-    normalize(path).to_string_lossy().to_lowercase()
+    let s = normalize(path).to_string_lossy().into_owned();
+    if cfg!(windows) { s.to_lowercase() } else { s }
+}
+
+/// `true` si la clave `k` es `root` o una ruta dentro de `root` (ambas de [`key`]).
+pub fn key_within(k: &str, root: &str) -> bool {
+    match k.strip_prefix(root) {
+        Some("") => true,
+        Some(rest) => rest.starts_with(SEP) || root.ends_with(SEP),
+        None => false,
+    }
 }
 
 /// `c:\Users\x` → `/c/Users/x` (para scripts de Git Bash).
+#[cfg(windows)]
 pub fn to_msys(path: &Path) -> String {
     let s = normalize(path).to_string_lossy().replace('\\', "/");
     let b = s.as_bytes();
@@ -87,15 +120,16 @@ pub fn to_msys(path: &Path) -> String {
     }
 }
 
-/// Ruta corta para mostrar: `~\Desktop\Github`.
+/// Ruta corta para mostrar: `~\Desktop\Github` (Windows) o `~/projects/app` (Linux).
 pub fn display(path: &Path) -> String {
     let p = normalize(path);
     let h = normalize(&home());
     let ps = p.to_string_lossy();
     let hs = h.to_string_lossy();
-    if ps.len() >= hs.len() && ps[..hs.len()].eq_ignore_ascii_case(&hs) {
+    let same = |a: &str, b: &str| if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b };
+    if ps.len() >= hs.len() && ps.is_char_boundary(hs.len()) && same(&ps[..hs.len()], &hs) {
         let rest = &ps[hs.len()..];
-        if rest.is_empty() || rest.starts_with('\\') {
+        if rest.is_empty() || rest.starts_with(SEP) {
             return format!("~{rest}");
         }
     }
@@ -103,6 +137,7 @@ pub fn display(path: &Path) -> String {
 }
 
 /// Busca un ejecutable en el PATH (prueba .exe, .cmd y .bat).
+#[cfg(windows)]
 pub fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     let has_ext = Path::new(name).extension().is_some();
@@ -124,7 +159,18 @@ pub fn which(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Busca un ejecutable en el PATH (archivo con permiso de ejecución).
+#[cfg(not(windows))]
+pub fn which(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|c| std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+}
+
 /// Ubicación de Git Bash (`bin\bash.exe`, que prepara el entorno MSYS).
+#[cfg(windows)]
 pub fn find_git_bash(configured: Option<&str>) -> Option<PathBuf> {
     if let Some(c) = configured.filter(|c| !c.trim().is_empty()) {
         let p = expand(c);
@@ -146,6 +192,7 @@ pub fn find_git_bash(configured: Option<&str>) -> Option<PathBuf> {
 }
 
 /// `wt.exe` (alias de ejecución de la app de Windows Terminal).
+#[cfg(windows)]
 pub fn find_wt() -> Option<PathBuf> {
     if let Some(local) = dirs::data_local_dir() {
         let alias = local.join(r"Microsoft\WindowsApps\wt.exe");
@@ -161,6 +208,7 @@ pub fn find_wt() -> Option<PathBuf> {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn normalize_lowercases_drive_and_trims() {
         assert_eq!(normalize(Path::new(r"C:\Users\X\repo\")), PathBuf::from(r"c:\Users\X\repo"));
@@ -170,13 +218,51 @@ mod tests {
         assert_eq!(normalize(Path::new(r"C:\")), PathBuf::from(r"c:\"));
     }
 
+    #[cfg(windows)]
     #[test]
     fn key_ignores_case() {
         assert_eq!(key(Path::new(r"C:\Users\X")), key(Path::new(r"c:\users\x\")));
+        assert!(key_within(&key(Path::new(r"C:\R\App\sub")), &key(Path::new(r"c:\r\app"))));
+        assert!(!key_within(&key(Path::new(r"c:\r\app2")), &key(Path::new(r"c:\r\app"))));
+        assert!(key_within(&key(Path::new(r"c:\r")), &key(Path::new(r"c:\"))));
     }
 
+    #[cfg(windows)]
     #[test]
     fn msys_form() {
         assert_eq!(to_msys(Path::new(r"C:\Users\X Y\r")), "/c/Users/X Y/r");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn normalize_keeps_unix_paths() {
+        assert_eq!(normalize(Path::new("/home/ana/repo/")), PathBuf::from("/home/ana/repo"));
+        assert_eq!(normalize(Path::new("/home/ana/Repo")), PathBuf::from("/home/ana/Repo"));
+        assert_eq!(normalize(Path::new("/")), PathBuf::from("/"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn key_is_case_sensitive() {
+        assert_ne!(key(Path::new("/home/ana/Repo")), key(Path::new("/home/ana/repo")));
+        assert_eq!(key(Path::new("/home/ana/repo/")), key(Path::new("/home/ana/repo")));
+        assert!(key_within("/home/ana/repo/sub", "/home/ana/repo"));
+        assert!(key_within("/home/ana/repo", "/home/ana/repo"));
+        assert!(!key_within("/home/ana/repo2", "/home/ana/repo"));
+        assert!(key_within("/home", "/"));
+    }
+
+    #[test]
+    fn display_shortens_home() {
+        let inside = home().join("proyectos").join("app");
+        assert_eq!(display(&inside), format!("~{SEP}proyectos{SEP}app"));
+        assert_eq!(display(&home()), "~");
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn which_needs_exec_bit() {
+        assert!(which("sh").is_some());
+        assert!(which("claunch-no-existe-xyz").is_none());
     }
 }

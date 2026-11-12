@@ -7,6 +7,7 @@ mod launch;
 mod log;
 mod paths;
 mod setup;
+mod terminal;
 mod ui;
 mod util;
 
@@ -22,12 +23,24 @@ uso:
                                 bypass global de permisos (~/.claude/settings.json)
   claunch usage [--json]        uso del plan de Claude (ventanas de 5 h y 7 días)
   claunch demo                  la interfaz con datos de ejemplo (para mostrarla)
-  claunch setup [--uninstall]   instala en ~/.local/bin y añade perfiles a Windows Terminal
+";
+
+#[cfg(windows)]
+const HELP_PLATFORM: &str = "  claunch setup [--uninstall]   instala en ~/.local/bin y añade perfiles a Windows Terminal
   claunch --version
 
 archivos:
   config y sets   %APPDATA%\\claunch\\config.toml
   índice y log    %LOCALAPPDATA%\\claunch\\
+";
+
+#[cfg(not(windows))]
+const HELP_PLATFORM: &str = "  claunch setup                 instala en ~/.local/bin
+  claunch --version
+
+archivos:
+  config y sets   ~/.config/claunch/config.toml
+  índice y log    ~/.local/share/claunch/
 ";
 
 fn main() -> ExitCode {
@@ -42,7 +55,7 @@ fn main() -> ExitCode {
         Some("snapshot") => report(ui::snapshot(rest)),
         Some("demo") => report(ui::run_demo()),
         Some("-h" | "--help" | "help") => {
-            print!("{HELP}");
+            print!("{HELP}{HELP_PLATFORM}");
             ExitCode::SUCCESS
         }
         Some("-V" | "--version") => {
@@ -51,7 +64,7 @@ fn main() -> ExitCode {
         }
         None => report(ui::run()),
         Some(other) => {
-            eprintln!("claunch: subcomando desconocido «{other}»\n\n{HELP}");
+            eprintln!("claunch: subcomando desconocido «{other}»\n\n{HELP}{HELP_PLATFORM}");
             ExitCode::from(2)
         }
     }

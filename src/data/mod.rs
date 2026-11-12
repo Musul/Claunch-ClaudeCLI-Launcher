@@ -136,7 +136,7 @@ impl Catalog {
         self.repo(&k).or_else(|| {
             self.repos
                 .iter()
-                .filter(|r| k.starts_with(&format!("{}\\", r.key)))
+                .filter(|r| paths::key_within(&k, &r.key))
                 .max_by_key(|r| r.key.len())
         })
     }

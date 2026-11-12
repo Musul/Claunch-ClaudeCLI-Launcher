@@ -9,7 +9,8 @@
 //! - Solo lectura: claunch no renueva el token (rotaría las credenciales de
 //!   Claude Code). Si venció, se pide abrir Claude para que lo renueve.
 //! - Una consulta por minuto entre todas las ventanas de claunch: la última
-//!   lectura (sin token) se comparte en `%LOCALAPPDATA%\claunch\usage.json`.
+//!   lectura (sin token) se comparte en `usage.json`, en la carpeta de datos
+//!   de claunch (`%LOCALAPPDATA%\claunch` o `~/.local/share/claunch`).
 //!   Con 429 respeta `Retry-After`, también para las demás ventanas.
 //! - El endpoint no está documentado: si cambia, la barra muestra «sin datos»
 //!   y el motivo queda en el log.
@@ -302,7 +303,7 @@ fn agent() -> ureq::Agent {
         .timeout_global(Some(Duration::from_secs(15)))
         .http_status_as_error(false)
         .user_agent(concat!("claunch/", env!("CARGO_PKG_VERSION")))
-        // Almacén de certificados de Windows: funciona tras proxies corporativos.
+        // Almacén de certificados del sistema: funciona tras proxies corporativos.
         .tls_config(TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build())
         .build()
         .into()

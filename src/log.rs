@@ -1,4 +1,5 @@
-//! Bitácora local en `%LOCALAPPDATA%\claunch\claunch.log`.
+//! Bitácora local en `claunch.log`, en la carpeta de datos de claunch
+//! (`%LOCALAPPDATA%\claunch` en Windows, `~/.local/share/claunch` en Linux).
 //! Todo fallo degradado (archivo ilegible, proceso no verificable, escaneo
 //! parcial) queda aquí; los fallos que el usuario debe ver van además a un toast.
 

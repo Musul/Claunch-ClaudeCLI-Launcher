@@ -748,7 +748,12 @@ impl App {
             } else {
                 self.toast(
                     ToastKind::Warn,
-                    format!("{}: {}/{total} sin confirmar tras 15 s — revisa Windows Terminal", b.label, b.tokens.len()),
+                    format!(
+                        "{}: {}/{total} sin confirmar tras 15 s — revisa {}",
+                        b.label,
+                        b.tokens.len(),
+                        if cfg!(windows) { "Windows Terminal" } else { "la terminal (general.terminal)" }
+                    ),
                 );
             }
         }
@@ -1215,7 +1220,9 @@ impl App {
     ) -> OptionsModal {
         let o = existing.map(|e| e.options.clone()).unwrap_or_default();
         let mut fields = vec![Field::text(FieldId::Title, "Título", existing.and_then(|e| e.title.as_deref()).unwrap_or(""), &default_title)];
-        fields.push(shell_field(o.shell.unwrap_or(self.default_shell())));
+        if cfg!(windows) {
+            fields.push(shell_field(o.shell.unwrap_or(self.default_shell())));
+        }
         if session != SessionRef::New {
             fields.push(mode_field(o.fork));
         }
@@ -1272,7 +1279,10 @@ impl App {
                 .collect(),
             target,
         )];
-        f.push(shell_field(g.default_shell));
+        // La shell solo se elige en Windows; en Linux la sesión usa `$SHELL`.
+        if cfg!(windows) {
+            f.push(shell_field(g.default_shell));
+        }
         if existing {
             f.push(mode_field(false));
         }
@@ -2040,8 +2050,12 @@ mod tests {
         app.on_key(ch('o'));
         assert!(matches!(app.modal, Some(Modal::Options(_))));
         app.on_key(key(KeyCode::Right)); // Destino → ventana nueva
-        app.on_key(key(KeyCode::Down));
-        app.on_key(key(KeyCode::Down)); // Modo
+        // Bajar hasta «Modo» (en Windows hay antes una fila «Shell»).
+        let Some(Modal::Options(m)) = &app.modal else { unreachable!() };
+        let mode = m.fields.iter().position(|f| f.id == FieldId::Mode).unwrap();
+        for _ in 0..mode {
+            app.on_key(key(KeyCode::Down));
+        }
         app.on_key(key(KeyCode::Right)); // → fork
         app.on_key(key(KeyCode::Enter));
         let (items, placement, _) = &launched(&app)[0];

@@ -1,4 +1,5 @@
-//! Configuración y sets de sesiones: `%APPDATA%\claunch\config.toml`.
+//! Configuración y sets de sesiones: `%APPDATA%\claunch\config.toml` (Windows)
+//! o `~/.config/claunch/config.toml` (Linux).
 
 use std::path::PathBuf;
 
@@ -6,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::paths;
 
+/// Shell de cada pestaña en Windows. En Linux se ignora: la sesión arranca con
+/// `/bin/sh` y, si se deja abierta, sigue en `$SHELL`.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum Shell {
@@ -184,14 +187,19 @@ pub struct General {
     pub scan_exclude: Vec<String>,
     /// Ejecutable de Claude y argumentos previos; vacío = `claude` del PATH.
     pub claude_command: Vec<String>,
-    /// Ruta a `bash.exe` de Git; vacío = autodetectar.
+    /// Ruta a `bash.exe` de Git; vacío = autodetectar (Windows).
     pub git_bash: String,
+    /// Linux: terminal donde abrir sesiones, con los argumentos que van antes
+    /// del comando (`["kitty"]`, `["gnome-terminal", "--"]`, `["tmux"]`).
+    /// Vacío = tmux si claunch corre dentro de tmux; si no, `$TERMINAL` o el
+    /// primer emulador conocido instalado.
+    pub terminal: Vec<String>,
     pub default_shell: Shell,
     pub default_target: Target,
     /// Al salir de Claude, deja la shell abierta en la carpeta.
     pub keep_shell_open: bool,
     pub exit_after_launch: bool,
-    /// Perfil de Windows Terminal del que heredar icono y colores ("" = ninguno).
+    /// Perfil de Windows Terminal del que heredar icono y colores ("" = ninguno; Windows).
     pub wt_profile: String,
     pub tab_color: String,
     pub animations: bool,
@@ -200,12 +208,20 @@ pub struct General {
     pub show_usage: bool,
 }
 
+/// Carpetas donde se suelen guardar los repos. Las que no existen se ignoran.
+#[cfg(windows)]
+const DEFAULT_ROOTS: [&str; 8] = ["~/Desktop", "~/Documents", "~/Downloads", "~/source", "~/Projects", "~/dev", "~/code", "~/repos"];
+/// En Linux se distinguen mayúsculas: `~/projects` y `~/Projects` son distintas.
+#[cfg(not(windows))]
+const DEFAULT_ROOTS: [&str; 13] = [
+    "~/Desktop", "~/Documents", "~/Downloads", "~/projects", "~/Projects", "~/src", "~/dev", "~/code", "~/repos",
+    "~/git", "~/work", "~/workspace", "~/source",
+];
+
 impl Default for General {
     fn default() -> Self {
         General {
-            scan_roots: ["~/Desktop", "~/Documents", "~/Downloads", "~/source", "~/Projects", "~/dev", "~/code", "~/repos"]
-                .map(String::from)
-                .to_vec(),
+            scan_roots: DEFAULT_ROOTS.map(String::from).to_vec(),
             scan_depth: 5,
             scan_exclude: [
                 "node_modules", "AppData", "target", "dist", "build", "out", "venv", "__pycache__", "vendor",
@@ -215,6 +231,7 @@ impl Default for General {
             .to_vec(),
             claude_command: Vec::new(),
             git_bash: String::new(),
+            terminal: Vec::new(),
             default_shell: Shell::GitBash,
             default_target: Target::Tab,
             keep_shell_open: true,
@@ -241,8 +258,9 @@ const HEADER: &str = "\
 #
 # [[set]] layout: \"tabs\" | \"panes\" | \"windows\"   window: \"new\" | \"current\"
 # [[set.entry]] session: \"new\" | \"latest\" | \"<uuid>\"
-#   shell: \"git-bash\" | \"powershell\" | \"cmd\"   model: \"opus\" | \"sonnet\" | ...
+#   shell (Windows): \"git-bash\" | \"powershell\" | \"cmd\"   model: \"opus\" | \"sonnet\" | ...
 #   permission_mode: \"plan\" | \"acceptEdits\" | ...   fork = true   name / worktree (solo nuevas)
+# [general] terminal (Linux): [\"tmux\"] | [\"kitty\"] | [\"gnome-terminal\", \"--\"] | [] = autodetectar
 
 ";
 

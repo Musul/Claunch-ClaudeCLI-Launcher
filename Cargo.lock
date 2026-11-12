@@ -201,6 +201,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "jiff",
+ "libc",
  "memchr",
  "ratatui",
  "rayon",

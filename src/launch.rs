@@ -1,11 +1,16 @@
-//! Arranque de sesiones en Windows Terminal (pestañas, paneles o ventanas).
+//! Arranque de sesiones en pestañas, paneles o ventanas.
 //!
-//! Cadena por pestaña: `wt.exe` → shell (Git Bash por defecto) → `claunch run
-//! <spec>` → `claude`. El paso intermedio fija el `cwd` con la unidad en
-//! minúscula (MSYS siempre la pasa en mayúscula y `/resume` dejaría de ver las
-//! sesiones de VS Code) y recibe los argumentos por un JSON UTF-8, sin las
-//! capas de escape de wt, bash y cmd. Al arrancar deja una marca
-//! `<token>.started` que la TUI usa para confirmar el arranque.
+//! Windows. Cadena por pestaña: `wt.exe` → shell (Git Bash por defecto) →
+//! `claunch run <spec>` → `claude`. El paso intermedio fija el `cwd` con la
+//! unidad en minúscula (MSYS siempre la pasa en mayúscula y `/resume` dejaría
+//! de ver las sesiones de VS Code) y recibe los argumentos por un JSON UTF-8,
+//! sin las capas de escape de wt, bash y cmd.
+//!
+//! Linux. tmux o un emulador gráfico (ver `terminal`) → `/bin/sh <script>` →
+//! `claunch run <spec>` → `claude`.
+//!
+//! Al arrancar, `claunch run` deja una marca `<token>.started` que la TUI usa
+//! para confirmar el arranque.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -30,6 +35,8 @@ pub struct LaunchItem {
     pub title: String,
     /// Texto corto para el banner y los avisos (nombre del repo).
     pub label: String,
+    /// Solo Windows: en Linux la sesión arranca con `/bin/sh`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub shell: Shell,
     pub tab_color: Option<String>,
     /// Mantener el título fijo aunque Claude lo cambie.
@@ -37,7 +44,7 @@ pub struct LaunchItem {
     pub session_id: Option<String>,
 }
 
-/// Cómo se reparten los elementos en Windows Terminal.
+/// Cómo se reparten los elementos (pestañas de Windows Terminal o ventanas de tmux).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     NewTab,
@@ -91,12 +98,32 @@ pub struct RunSpec {
     pub session_id: Option<String>,
 }
 
+/// Dónde se abren las pestañas y ventanas nuevas.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Terminal {
+    /// Windows Terminal (`wt.exe`).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Wt(PathBuf),
+    /// Windows sin Windows Terminal: una consola nueva por sesión.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Console,
+    /// Linux dentro de tmux: ventanas y paneles de la sesión de tmux actual.
+    Tmux,
+    /// Linux con escritorio: emulador y argumentos previos al comando; una
+    /// ventana por sesión.
+    Emulator(Vec<String>),
+    /// Linux sin tmux ni escritorio (SSH): solo «Esta terminal».
+    Unavailable,
+}
+
 /// Ejecutables resueltos una vez por arranque.
 #[derive(Debug, Clone)]
 pub struct Env {
     pub claude: Vec<String>,
+    /// Git Bash (Windows).
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub git_bash: Option<PathBuf>,
-    pub wt: Option<PathBuf>,
+    pub terminal: Terminal,
     pub self_exe: PathBuf,
     pub general: General,
 }
@@ -111,11 +138,16 @@ impl Env {
             let p = paths::which("claude").context("no encuentro `claude` en el PATH")?;
             vec![p.to_string_lossy().into_owned()]
         };
+        #[cfg(windows)]
+        let (git_bash, terminal) =
+            (paths::find_git_bash(Some(&general.git_bash)), paths::find_wt().map_or(Terminal::Console, Terminal::Wt));
+        #[cfg(not(windows))]
+        let (git_bash, terminal) = (None, crate::terminal::detect(&general.terminal));
         Ok(Env {
             claude,
-            git_bash: paths::find_git_bash(Some(&general.git_bash)),
-            wt: paths::find_wt(),
-            self_exe: std::env::current_exe().context("no se pudo ubicar claunch.exe")?,
+            git_bash,
+            terminal,
+            self_exe: std::env::current_exe().context("no se pudo ubicar el ejecutable de claunch")?,
             general: general.clone(),
         })
     }
@@ -133,6 +165,7 @@ impl Env {
     }
 
     /// Línea de comandos de la shell que ejecuta `claunch run <spec>`.
+    #[cfg(windows)]
     fn shell_cmdline(&self, item: &LaunchItem, spec_path: &Path) -> anyhow::Result<Vec<String>> {
         let exe = self.self_exe.to_string_lossy().into_owned();
         let spec = spec_path.to_string_lossy().into_owned();
@@ -141,7 +174,7 @@ impl Env {
             Shell::GitBash => {
                 let bash = self.git_bash.as_ref().context("no encuentro Git Bash (configura general.git_bash)")?;
                 let script = spec_path.with_extension("sh");
-                let q = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+                let q = |s: &str| crate::terminal::sh_quote(s);
                 let mut body = String::from("# claunch: arranque generado, se borra solo.\nexport CHERE_INVOKING=1\n");
                 body += &format!("cd {} 2>/dev/null\n", q(&paths::to_msys(&item.cwd)));
                 body += &format!(
@@ -171,10 +204,37 @@ impl Env {
         })
     }
 
+    /// Script de `/bin/sh` que ejecuta `claunch run <spec>` (la shell elegida
+    /// en `item.shell` solo aplica a Windows). Si se deja abierta, sigue en `$SHELL`.
+    #[cfg(not(windows))]
+    fn shell_cmdline(&self, item: &LaunchItem, spec_path: &Path) -> anyhow::Result<Vec<String>> {
+        use crate::terminal::sh_quote as q;
+        let script = spec_path.with_extension("sh");
+        let mut body = String::from("# claunch: arranque generado, se borra solo.\n");
+        // Ctrl+C llega también a esta shell: sin trap, dash termina al salir
+        // Claude y se pierden el aviso para retomar y la shell. El trap no lo
+        // heredan los hijos (vuelve al valor por defecto en exec).
+        body += "trap : INT\n";
+        body += &format!("cd {} 2>/dev/null\n", q(&item.cwd.to_string_lossy()));
+        body += &format!("{} run {}\n", q(&self.self_exe.to_string_lossy()), q(&spec_path.to_string_lossy()));
+        body += "rm -f -- \"$0\"\n";
+        if self.general.keep_shell_open {
+            body += "exec \"${SHELL:-/bin/sh}\"\n";
+        }
+        crate::util::write_atomic(&script, body.as_bytes())?;
+        Ok(vec!["/bin/sh".into(), script.to_string_lossy().into_owned()])
+    }
+
     /// Prepara specs y lanza. Devuelve los tokens a confirmar.
     pub fn launch(&self, items: &[LaunchItem], placement: Placement) -> anyhow::Result<Vec<(String, String)>> {
         if items.is_empty() {
             bail!("no hay sesiones que abrir");
+        }
+        if self.terminal == Terminal::Unavailable {
+            bail!(
+                "no hay dónde abrir pestañas: claunch no corre dentro de tmux ni en un escritorio gráfico. \
+                 Ábrela en «Esta terminal» (tecla o → Destino), entra en tmux o configura general.terminal"
+            );
         }
         let dir = paths::launch_dir();
         std::fs::create_dir_all(&dir)?;
@@ -192,17 +252,24 @@ impl Env {
             prepared.push((item, cmd));
         }
 
-        let Some(wt) = &self.wt else {
-            // Sin Windows Terminal: una consola nueva por sesión.
-            for (item, cmd) in &prepared {
-                spawn_console(cmd, &item.cwd)?;
+        match &self.terminal {
+            Terminal::Wt(wt) => {
+                let profile = (!self.general.wt_profile.is_empty()).then_some(self.general.wt_profile.as_str());
+                for args in wt_invocations(&prepared, placement, profile) {
+                    crate::info_log!("wt {}", args.join(" "));
+                    Command::new(wt).args(&args).spawn().with_context(|| format!("no se pudo ejecutar {}", wt.display()))?;
+                }
             }
-            return Ok(tokens);
-        };
-        let profile = (!self.general.wt_profile.is_empty()).then_some(self.general.wt_profile.as_str());
-        for args in wt_invocations(&prepared, placement, profile) {
-            crate::info_log!("wt {}", args.join(" "));
-            Command::new(wt).args(&args).spawn().with_context(|| format!("no se pudo ejecutar {}", wt.display()))?;
+            Terminal::Console => {
+                for (item, cmd) in &prepared {
+                    spawn_console(cmd, &item.cwd)?;
+                }
+            }
+            #[cfg(not(windows))]
+            Terminal::Tmux => crate::terminal::run_tmux(&prepared, placement)?,
+            #[cfg(not(windows))]
+            Terminal::Emulator(prefix) => crate::terminal::spawn_emulator(prefix, &prepared, placement)?,
+            other => bail!("{other:?} no está disponible en este sistema"),
         }
         Ok(tokens)
     }
@@ -229,10 +296,12 @@ fn spawn_console(cmd: &[String], cwd: &Path) -> anyhow::Result<()> {
 }
 
 /// wt separa subcomandos con `;`: dentro de un argumento hay que escaparlo.
+#[cfg_attr(not(windows), allow(dead_code))]
 fn wt_escape(s: &str) -> String {
     s.replace(';', r"\;")
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn pane_args(item: &LaunchItem, cmd: &[String], profile: Option<&str>) -> Vec<String> {
     let mut a = Vec::new();
     if let Some(p) = profile {
@@ -261,11 +330,13 @@ pub fn pane_grid(n: usize) -> Vec<usize> {
     (0..cols).map(|c| if c >= cols - extra { base + 1 } else { base }).collect()
 }
 
+#[cfg_attr(not(windows), allow(dead_code))]
 fn frac(num: usize, den: usize) -> String {
     format!("{:.3}", num as f64 / den as f64)
 }
 
 /// Argumentos de cada invocación de `wt.exe`.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn wt_invocations(items: &[(&LaunchItem, Vec<String>)], placement: Placement, profile: Option<&str>) -> Vec<Vec<String>> {
     let sep = || ";".to_string();
     let window = |w: SetWindow| match w {
@@ -360,7 +431,24 @@ fn ignore_ctrl_c() {
     }
 }
 
-#[cfg(not(windows))]
+/// Ignora SIGINT en claunch mientras Claude corre: Ctrl+C también llega a
+/// claunch (mismo grupo de procesos) y, si lo matara, la shell retomaría la
+/// terminal con Claude aún vivo. Un handler propio, a diferencia de `SIG_IGN`,
+/// vuelve al valor por defecto en `exec`: Claude no lo hereda.
+#[cfg(unix)]
+fn ignore_ctrl_c() {
+    extern "C" fn handler(_sig: libc::c_int) {}
+    // SAFETY: registra una función sin estado que no hace nada.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
 fn ignore_ctrl_c() {}
 
 const ACCENT: &str = "\x1b[38;2;217;119;87m";
