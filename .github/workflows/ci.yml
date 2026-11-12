@@ -8,7 +8,11 @@ on:
 # Solo acciones de GitHub (actions/*): la organización puede bloquear las de terceros.
 jobs:
   test:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Rust estable (rustup ya viene en el runner)
@@ -22,9 +26,16 @@ jobs:
           key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-${{ runner.os }}-
       - run: cargo test --locked
-      - name: Instalador (sintaxis PowerShell 5.1)
+      - name: Instalador de Windows (sintaxis PowerShell 5.1)
+        if: runner.os == 'Windows'
         shell: powershell
         run: |
           $errs = $null
           [void][System.Management.Automation.Language.Parser]::ParseFile("$PWD\install.ps1", [ref]$null, [ref]$errs)
           if ($errs.Count) { $errs | ForEach-Object { Write-Error $_.Message }; exit 1 }
+      - name: Instalador de Linux (sh -n y shellcheck)
+        if: runner.os == 'Linux'
+        run: |
+          sh -n install.sh
+          shellcheck -s sh install.sh
+          test -x install.sh || { echo "install.sh debe ser ejecutable (git update-index --chmod=+x)"; exit 1; }

@@ -1,7 +1,8 @@
 name: release
 
-# Publica claunch-windows-x64.zip (+ .sha256) al empujar una etiqueta vX.Y.Z.
-# install.ps1 descarga siempre la última release publicada.
+# Publica claunch-windows-x64.zip y claunch-linux-x64.tar.gz (+ .sha256) al
+# empujar una etiqueta vX.Y.Z. install.ps1 e install.sh descargan siempre la
+# última release publicada. Si un binario falla, no se publica nada.
 on:
   push:
     tags: ['v*']
@@ -11,7 +12,7 @@ permissions:
 
 # Solo acciones de GitHub (actions/*): la organización puede bloquear las de terceros.
 jobs:
-  release:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,8 +33,51 @@ jobs:
           $h = (Get-FileHash dist/claunch-windows-x64.zip -Algorithm SHA256).Hash.ToLower()
           "$h  claunch-windows-x64.zip" | Out-File -Encoding ascii dist/claunch-windows-x64.zip.sha256
           Get-Content dist/claunch-windows-x64.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  # Binario estático (musl): funciona en cualquier distribución x86_64.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust estable con destino musl
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-unknown-linux-musl
+          rustup default stable
+          sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: La etiqueta coincide con Cargo.toml
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          [ "v$v" = "$GITHUB_REF_NAME" ] || { echo "La etiqueta $GITHUB_REF_NAME no coincide con Cargo.toml (v$v)"; exit 1; }
+      - run: cargo test --locked
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Empaquetar
+        run: |
+          mkdir dist
+          tar -czf dist/claunch-linux-x64.tar.gz -C target/x86_64-unknown-linux-musl/release claunch
+          (cd dist && sha256sum claunch-linux-x64.tar.gz > claunch-linux-x64.tar.gz.sha256)
+          cat dist/claunch-linux-x64.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publicar release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create $env:GITHUB_REF_NAME dist/claunch-windows-x64.zip dist/claunch-windows-x64.zip.sha256 --title "claunch $env:GITHUB_REF_NAME" --generate-notes
+        run: |
+          ls -l dist
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "claunch $GITHUB_REF_NAME" --generate-notes

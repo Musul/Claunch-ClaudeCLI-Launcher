@@ -100,7 +100,7 @@
     Write-Host '  claunch - launcher de sesiones de Claude Code' -ForegroundColor DarkYellow
     Write-Host "  https://github.com/$Repo" -ForegroundColor DarkGray
 
-    if ($env:OS -ne 'Windows_NT') { Fail 'claunch es solo para Windows.' }
+    if ($env:OS -ne 'Windows_NT') { Fail 'Este instalador es para Windows. En Linux usa install.sh (ver README).' }
     if (-not [Environment]::Is64BitOperatingSystem) { Fail 'claunch necesita Windows de 64 bits.' }
 
     # ------------------------------------------------------------ requisitos
