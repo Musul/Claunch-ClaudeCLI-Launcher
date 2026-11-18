@@ -3,10 +3,12 @@
 #   irm https://raw.githubusercontent.com/Musul/Claunch-ClaudeCLI-Launcher/main/install.ps1 | iex
 #
 # Que hace:
-#   1. Revisa Git for Windows, Windows Terminal y Claude Code (ofrece instalar lo que falte).
+#   1. Revisa Git for Windows y Windows Terminal (ofrece instalar lo que falte).
 #   2. Descarga claunch.exe de la ultima version publicada y verifica su SHA-256.
 #      Si no hay version publicada (o el repo es privado), usa `gh` o compila con cargo.
-#   3. Lo instala en %USERPROFILE%\.local\bin, crea los perfiles de Windows Terminal
+#   3. Revisa que agentes hay (Claude Code, Codex, opencode, Antigravity, Pi); si no
+#      hay ninguno, ofrece el instalador oficial de Claude Code.
+#   4. Lo instala en %USERPROFILE%\.local\bin, crea los perfiles de Windows Terminal
 #      y anade esa carpeta al PATH del usuario.
 # Volver a ejecutarlo actualiza a la ultima version.
 #
@@ -97,7 +99,8 @@
     }
 
     Write-Host ''
-    Write-Host '  claunch - launcher de sesiones de Claude Code' -ForegroundColor DarkYellow
+    Write-Host '  claunch - launcher de sesiones de agentes de codigo' -ForegroundColor DarkYellow
+    Write-Host '  Claude Code, Codex, opencode, Antigravity y Pi' -ForegroundColor DarkGray
     Write-Host "  https://github.com/$Repo" -ForegroundColor DarkGray
 
     if ($env:OS -ne 'Windows_NT') { Fail 'Este instalador es para Windows. En Linux usa install.sh (ver README).' }
@@ -117,18 +120,6 @@
     } else {
         [void](Winget-Install 'Microsoft.WindowsTerminal' 'Windows Terminal')
         if ((Has-Command wt.exe) -or (Test-Path $wtAlias)) { Ok 'Windows Terminal' } else { Warn 'Sin Windows Terminal: claunch solo podra abrir sesiones en la terminal actual.' }
-    }
-
-    if ((Has-Command claude) -or (Test-Path (Join-Path $Bin 'claude.exe'))) {
-        Ok 'Claude Code'
-    } else {
-        Warn 'No encuentro Claude Code (comando claude).'
-        if (Ask 'Lo instalo con el instalador oficial (https://claude.ai/install.ps1)?') {
-            Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression
-            Refresh-Path
-        } else {
-            Info 'Instalalo despues con:  irm https://claude.ai/install.ps1 | iex'
-        }
     }
 
     # ------------------------------------------------------------ binario
@@ -191,6 +182,40 @@
             }
         }
         if (-not (Test-Path $exe)) { Fail "No se genero $exe" }
+
+        # -------------------------------------------------------- agentes
+        # claunch trabaja con los agentes que encuentre: basta con uno. Lo dice el
+        # propio binario, que tambien los ve fuera del PATH (el Codex de la app de
+        # escritorio o de VS Code, el agy que mantiene su actualizador).
+        Step 'Revisando agentes'
+        $agents = @()
+        $code = 1
+        $prevPref = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $agents = @(& $exe agents --installed 2>$null | Where-Object { $_ })
+            $code = $LASTEXITCODE
+        } catch {
+            $code = 1
+        } finally {
+            $ErrorActionPreference = $prevPref
+        }
+        if ($code -ne 0) {
+            # Una version anterior de claunch, sin ese subcomando: solo conoce Claude Code.
+            $agents = @()
+            if ((Has-Command claude) -or (Test-Path (Join-Path $Bin 'claude.exe'))) { $agents = @('Claude Code') }
+        }
+        if ($agents.Count -gt 0) {
+            Ok "Agentes: $($agents -join ', ')"
+        } else {
+            Warn 'No encuentro ningun agente (Claude Code, Codex, opencode, Antigravity ni Pi).'
+            if (Ask 'Instalo Claude Code con el instalador oficial (https://claude.ai/install.ps1)?') {
+                Invoke-RestMethod https://claude.ai/install.ps1 | Invoke-Expression
+                Refresh-Path
+            } else {
+                Info 'Instala al menos uno; por ejemplo:  irm https://claude.ai/install.ps1 | iex'
+            }
+        }
 
         # -------------------------------------------------------- instalar
         if ($DryRun) {

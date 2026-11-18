@@ -4,12 +4,14 @@
 #   curl -fsSL https://raw.githubusercontent.com/Musul/Claunch-ClaudeCLI-Launcher/main/install.sh | sh
 #
 # Qué hace:
-#   1. Revisa Claude Code (ofrece el instalador oficial si falta) y dónde podrá
-#      abrir sesiones: tmux o un escritorio gráfico.
+#   1. Revisa dónde podrá abrir sesiones: tmux o un escritorio gráfico.
 #   2. Descarga claunch de la última versión publicada y verifica su SHA-256.
 #      Si no hay binario para tu arquitectura o no se puede descargar, usa `gh`
 #      o compila con cargo.
-#   3. Lo instala en ~/.local/bin (claunch setup) y, si esa carpeta no está en
+#   3. Revisa qué agentes hay instalados (Claude Code, Codex, opencode,
+#      Antigravity, Pi); si no hay ninguno, ofrece el instalador oficial de
+#      Claude Code.
+#   4. Lo instala en ~/.local/bin (claunch setup) y, si esa carpeta no está en
 #      el PATH, ofrece añadirla a ~/.bashrc o ~/.zshrc.
 # Volver a ejecutarlo actualiza a la última versión.
 #
@@ -36,7 +38,8 @@ main() {
         C_STEP='' C_OK='' C_DIM='' C_WARN='' C_ERR='' C_ACC='' C_END=''
     fi
 
-    printf '\n  %bclaunch - launcher de sesiones de Claude Code%b\n' "$C_ACC" "$C_END"
+    printf '\n  %bclaunch - launcher de sesiones de agentes de código%b\n' "$C_ACC" "$C_END"
+    printf '  %bClaude Code, Codex, opencode, Antigravity y Pi%b\n' "$C_DIM" "$C_END"
     printf '  %bhttps://github.com/%s%b\n' "$C_DIM" "$REPO" "$C_END"
 
     [ "$(uname -s)" = Linux ] || fail "Este instalador es para Linux. En Windows usa install.ps1 (ver README)."
@@ -56,17 +59,6 @@ main() {
 
     # -------------------------------------------------------------- requisitos
     step 'Revisando requisitos'
-    if has claude || [ -x "$BIN/claude" ]; then
-        ok 'Claude Code'
-    else
-        warn 'No encuentro Claude Code (comando claude).'
-        if ask '¿Lo instalo con el instalador oficial (https://claude.ai/install.sh)?'; then
-            fetch https://claude.ai/install.sh - | bash
-        else
-            info 'Instálalo después con:  curl -fsSL https://claude.ai/install.sh | bash'
-        fi
-    fi
-
     if [ -n "${TMUX:-}" ]; then
         ok 'tmux (claunch está dentro de tmux: pestañas y paneles)'
     elif has tmux; then
@@ -147,6 +139,29 @@ main() {
         fi
     fi
     [ -x "$exe" ] || fail "No se generó $exe"
+
+    # -------------------------------------------------------------- agentes
+    # claunch trabaja con los agentes que encuentre: basta con uno. Lo dice el
+    # propio binario, que también los ve fuera del PATH (el Codex de VS Code,
+    # el agy que mantiene su actualizador).
+    step 'Revisando agentes'
+    if agents=$("$exe" agents --installed 2>/dev/null); then
+        agents=$(printf '%s' "$agents" | tr '\n' ',' | sed 's/,$//; s/,/, /g')
+    else
+        # Una versión anterior de claunch, sin ese subcomando: solo conoce Claude Code.
+        agents=''
+        if has claude || [ -x "$BIN/claude" ]; then agents='Claude Code'; fi
+    fi
+    if [ -n "$agents" ]; then
+        ok "Agentes: $agents"
+    else
+        warn 'No encuentro ningún agente (Claude Code, Codex, opencode, Antigravity ni Pi).'
+        if ask '¿Instalo Claude Code con el instalador oficial (https://claude.ai/install.sh)?'; then
+            fetch https://claude.ai/install.sh - | bash
+        else
+            info 'Instala al menos uno; por ejemplo:  curl -fsSL https://claude.ai/install.sh | bash'
+        fi
+    fi
 
     # -------------------------------------------------------------- instalar
     if [ "$DRY_RUN" = 1 ]; then
