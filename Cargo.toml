@@ -1,6 +1,6 @@
 [package]
 name = "claunch"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Launcher TUI para repos y sesiones de agentes de código (Claude Code, Codex, opencode, Antigravity y Pi) en Windows (Windows Terminal + Git Bash) y Linux (tmux o emulador gráfico)"
 license = "MIT"
