@@ -53,16 +53,24 @@ pub fn lerp(a: Color, b: Color, t: f32) -> Color {
     Color::Rgb(m(ar, br), m(ag, bg), m(ab, bb))
 }
 
-/// Color del punto de superficie (CLI, VS Code, Desktop) de una sesión.
+/// Color del punto de superficie (CLI, VS Code, Desktop) de una sesión. Claude
+/// guarda sus propios nombres; los demás harness se indexan ya normalizados.
 pub fn entrypoint(e: &str) -> (&'static str, Color) {
     match e {
-        "claude-vscode" => ("VS Code", BLUE),
-        "claude-desktop" => ("Desktop", VIOLET),
+        "claude-vscode" | "vscode" => ("VS Code", BLUE),
+        "claude-desktop" | "desktop" => ("Desktop", VIOLET),
+        "ide" => ("IDE", BLUE),
         "cli" => ("CLI", TEXT_DIM),
-        "sdk-cli" | "sdk-ts" | "sdk-py" => ("SDK", TEXT_DIM),
+        "sdk-cli" | "sdk-ts" | "sdk-py" | "sdk" => ("SDK", TEXT_DIM),
+        "web" => ("Web", TEXT_DIM),
         "" => ("", TEXT_DIM),
         _ => ("otro", TEXT_DIM),
     }
+}
+
+/// Color con el que se rotula un harness (el mismo de sus pestañas).
+pub fn harness_color(h: crate::harness::Harness) -> Color {
+    parse_hex(h.info().color).unwrap_or(ACCENT)
 }
 
 /// Colores de pestaña ofrecidos al configurar entradas de set.

@@ -1,10 +1,12 @@
 //! Configuración y sets de sesiones: `%APPDATA%\claunch\config.toml` (Windows)
 //! o `~/.config/claunch/config.toml` (Linux).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::harness::Harness;
 use crate::paths;
 
 /// Shell de cada pestaña en Windows. En Linux se ignora: la sesión arranca con
@@ -137,10 +139,10 @@ pub struct LaunchOptions {
     pub permission_mode: Option<String>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub fork: bool,
-    /// `-n`: nombre visible de una sesión nueva.
+    /// Nombre visible de una sesión nueva (si el harness lo admite).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// `-w`: crear la sesión nueva en un worktree con este nombre.
+    /// Crear la sesión nueva en un worktree con este nombre (si el harness lo admite).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<String>,
 }
@@ -153,6 +155,9 @@ pub struct SetEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     pub session: SessionRef,
+    /// Harness de la sesión; sin indicar, Claude Code.
+    #[serde(default, skip_serializing_if = "Harness::is_claude")]
+    pub harness: Harness,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -185,7 +190,10 @@ pub struct General {
     pub scan_roots: Vec<String>,
     pub scan_depth: usize,
     pub scan_exclude: Vec<String>,
+    /// Harness de «Nueva sesión» mientras no se elija otro.
+    pub default_harness: Harness,
     /// Ejecutable de Claude y argumentos previos; vacío = `claude` del PATH.
+    /// Equivale a `[harness.claude] command`, que tiene prioridad.
     pub claude_command: Vec<String>,
     /// Ruta a `bash.exe` de Git; vacío = autodetectar (Windows).
     pub git_bash: String,
@@ -208,6 +216,10 @@ pub struct General {
     pub show_usage: bool,
 }
 
+/// Color de pestaña de fábrica (el de Claude). Mientras `general.tab_color`
+/// siga así, cada harness usa el suyo.
+pub const DEFAULT_TAB_COLOR: &str = "#D97757";
+
 /// Carpetas donde se suelen guardar los repos. Las que no existen se ignoran.
 #[cfg(windows)]
 const DEFAULT_ROOTS: [&str; 8] = ["~/Desktop", "~/Documents", "~/Downloads", "~/source", "~/Projects", "~/dev", "~/code", "~/repos"];
@@ -229,6 +241,7 @@ impl Default for General {
             ]
             .map(String::from)
             .to_vec(),
+            default_harness: Harness::Claude,
             claude_command: Vec::new(),
             git_bash: String::new(),
             terminal: Vec::new(),
@@ -237,17 +250,45 @@ impl Default for General {
             keep_shell_open: true,
             exit_after_launch: false,
             wt_profile: String::new(),
-            tab_color: "#D97757".into(),
+            tab_color: DEFAULT_TAB_COLOR.into(),
             animations: true,
             show_usage: true,
         }
     }
 }
 
+/// Ajustes de un harness: `[harness.codex]`, `[harness.opencode]`…
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HarnessCfg {
+    /// `false`: ni se indexan sus sesiones ni se ofrece al abrir.
+    #[serde(skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    /// Ejecutable y argumentos previos; vacío = el del PATH.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Carpeta de datos del harness; vacía = la suya por defecto.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub home: String,
+}
+
+impl Default for HarnessCfg {
+    fn default() -> Self {
+        HarnessCfg { enabled: true, command: Vec::new(), home: String::new() }
+    }
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct Config {
     #[serde(default)]
     pub general: General,
+    /// Ajustes por harness; los que no aparecen usan los valores por defecto.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub harness: BTreeMap<Harness, HarnessCfg>,
     #[serde(default, rename = "set")]
     pub sets: Vec<SessionSet>,
 }
@@ -257,10 +298,13 @@ const HEADER: &str = "\
 # La TUI reescribe este archivo al editar sets (se pierden comentarios propios).
 #
 # [[set]] layout: \"tabs\" | \"panes\" | \"windows\"   window: \"new\" | \"current\"
-# [[set.entry]] session: \"new\" | \"latest\" | \"<uuid>\"
+# [[set.entry]] session: \"new\" | \"latest\" | \"<id>\"
+#   harness: \"claude\" (por defecto) | \"codex\" | \"opencode\" | \"antigravity\" | \"pi\"
 #   shell (Windows): \"git-bash\" | \"powershell\" | \"cmd\"   model: \"opus\" | \"sonnet\" | ...
-#   permission_mode: \"plan\" | \"acceptEdits\" | ...   fork = true   name / worktree (solo nuevas)
-# [general] terminal (Linux): [\"tmux\"] | [\"kitty\"] | [\"gnome-terminal\", \"--\"] | [] = autodetectar
+#   permission_mode: \"plan\" | \"acceptEdits\" | ... (según el harness)   fork = true   name / worktree (solo nuevas)
+# [general] default_harness: harness de «Nueva sesión»
+#   terminal (Linux): [\"tmux\"] | [\"kitty\"] | [\"gnome-terminal\", \"--\"] | [] = autodetectar
+# [harness.codex] enabled = false | command = [\"codex\"] | home = \"~/.codex\"   (igual para los demás)
 
 ";
 
@@ -303,6 +347,34 @@ impl Config {
     pub fn scan_roots(&self) -> Vec<PathBuf> {
         self.general.scan_roots.iter().map(|r| paths::normalize(&paths::expand(r))).collect()
     }
+
+    /// `false` si el usuario apagó el harness con `[harness.x] enabled = false`.
+    pub fn harness_enabled(&self, h: Harness) -> bool {
+        self.harness.get(&h).is_none_or(|c| c.enabled)
+    }
+
+    /// Carpeta de datos del harness: la configurada o la suya por defecto.
+    pub fn harness_home(&self, h: Harness) -> PathBuf {
+        match self.harness.get(&h).map(|c| c.home.trim()).filter(|d| !d.is_empty()) {
+            Some(dir) => paths::expand(dir),
+            None => h.home(),
+        }
+    }
+
+    /// Comando configurado para el harness (ejecutable y argumentos previos);
+    /// vacío si hay que buscarlo en el PATH.
+    pub fn harness_command(&self, h: Harness) -> Vec<String> {
+        match self.harness.get(&h).filter(|c| !c.command.is_empty()) {
+            Some(c) => c.command.clone(),
+            None if h == Harness::Claude => self.general.claude_command.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Harness activos con su carpeta de datos.
+    pub fn harness_sources(&self) -> Vec<(Harness, PathBuf)> {
+        Harness::ALL.into_iter().filter(|h| self.harness_enabled(*h)).map(|h| (h, self.harness_home(h))).collect()
+    }
 }
 
 #[cfg(test)]
@@ -321,6 +393,7 @@ mod tests {
                     repo: r"c:\r\app".into(),
                     cwd: None,
                     session: SessionRef::Latest,
+                    harness: Harness::Claude,
                     title: Some("App".into()),
                     tab_color: None,
                     options: LaunchOptions { model: Some("opus".into()), ..Default::default() },
@@ -329,6 +402,7 @@ mod tests {
                     repo: r"c:\r\vm".into(),
                     cwd: Some(r"c:\r\vm\infra".into()),
                     session: SessionRef::Id("0f6c2b1e-5d4a-4c3b-9a8e-7d6f5e4c3b2a".into()),
+                    harness: Harness::Codex,
                     title: None,
                     tab_color: Some("#7FB77E".into()),
                     options: LaunchOptions { fork: true, shell: Some(Shell::Powershell), ..Default::default() },
@@ -339,6 +413,50 @@ mod tests {
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(back, c);
         assert!(text.contains("session = \"latest\""));
+        // El harness solo se escribe si no es Claude.
+        assert_eq!(text.matches("\nharness = ").count(), 1, "{text}");
+        assert!(text.contains("harness = \"codex\""));
+    }
+
+    #[test]
+    fn harness_tables_roundtrip_and_resolve() {
+        let text = r#"
+[general]
+default_harness = "pi"
+claude_command = ["claude-beta"]
+
+[harness.codex]
+command = ["npx", "codex"]
+home = "~/codex-datos"
+
+[harness.opencode]
+enabled = false
+"#;
+        let c: Config = toml::from_str(text).unwrap();
+        assert_eq!(c.general.default_harness, Harness::Pi);
+        assert_eq!(c.harness_command(Harness::Codex), ["npx", "codex"]);
+        assert_eq!(c.harness_home(Harness::Codex), paths::home().join("codex-datos"));
+        assert!(!c.harness_enabled(Harness::Opencode));
+        assert!(c.harness_enabled(Harness::Antigravity));
+        // `claude_command` sigue valiendo si no hay `[harness.claude] command`.
+        assert_eq!(c.harness_command(Harness::Claude), ["claude-beta"]);
+        assert!(c.harness_command(Harness::Pi).is_empty());
+        assert!(!c.harness_sources().iter().any(|(h, _)| *h == Harness::Opencode));
+        assert_eq!(c.harness_sources().len(), Harness::ALL.len() - 1);
+
+        let again: Config = toml::from_str(&format!("{HEADER}{}", toml::to_string_pretty(&c).unwrap())).unwrap();
+        assert_eq!(again, c);
+    }
+
+    #[test]
+    fn old_config_without_harness_still_loads() {
+        let text = "[[set]]\nname = \"x\"\n[[set.entry]]\nrepo = 'c:\\r\\app'\nsession = \"new\"\nmodel = \"opus\"\n";
+        let c: Config = toml::from_str(text).unwrap();
+        assert_eq!(c.sets[0].entries[0].harness, Harness::Claude);
+        assert_eq!(c.general.default_harness, Harness::Claude);
+        assert!(c.harness.is_empty());
+        // Sin tablas de harness, la config guardada no gana secciones nuevas.
+        assert!(!toml::to_string_pretty(&c).unwrap().contains("[harness"));
     }
 
     #[test]

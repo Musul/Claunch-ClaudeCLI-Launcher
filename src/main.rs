@@ -1,8 +1,10 @@
-//! claunch — launcher TUI de repos y sesiones de Claude Code.
+//! claunch — launcher TUI de repos y sesiones de agentes de código: Claude
+//! Code, Codex, opencode, Antigravity y Pi.
 
 mod claude_settings;
 mod config;
 mod data;
+mod harness;
 mod launch;
 mod log;
 mod paths;
@@ -14,13 +16,17 @@ mod util;
 use std::process::ExitCode;
 
 const HELP: &str = "\
-claunch — launcher de sesiones de Claude Code
+claunch — launcher de sesiones de agentes de código
+          (Claude Code, Codex, opencode, Antigravity y Pi)
 
 uso:
   claunch                       abre la TUI
   claunch open <set>            abre un set por nombre sin TUI
+  claunch agents [--json | --installed]
+                                agentes detectados: ejecutable, datos y sesiones
+                                (--installed: solo los nombres de los instalados)
   claunch bypass [status|on|off] [--yes]
-                                bypass global de permisos (~/.claude/settings.json)
+                                bypass global de permisos de Claude (~/.claude/settings.json)
   claunch usage [--json]        uso del plan de Claude (ventanas de 5 h y 7 días)
   claunch demo                  la interfaz con datos de ejemplo (para mostrarla)
 ";
@@ -51,6 +57,7 @@ fn main() -> ExitCode {
         Some("bypass") => claude_settings::cli(rest),
         Some("setup") => setup::main(rest),
         Some("open") => open_set(rest),
+        Some("agents" | "harness" | "harnesses") => report(ui::agents(rest)),
         Some("usage") => data::usage::cli(rest),
         Some("snapshot") => report(ui::snapshot(rest)),
         Some("demo") => report(ui::run_demo()),

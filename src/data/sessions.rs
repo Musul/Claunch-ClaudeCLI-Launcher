@@ -1,17 +1,18 @@
-//! Indexador de sesiones de Claude Code (`~/.claude/projects/*/<uuid>.jsonl`).
+//! Metadatos de una sesión e índice incremental de archivos `.jsonl`.
 //!
-//! Los `.jsonl` crecen solo por el final, así que el índice es incremental:
-//! guarda hasta qué byte leyó y una huella de los últimos bytes. Si la huella
-//! coincide, solo parsea lo añadido; si no (archivo reescrito), relee todo.
+//! Los `.jsonl` de sesión (Claude Code, Codex, Pi) crecen solo por el final,
+//! así que el índice es incremental: guarda hasta qué byte leyó y una huella de
+//! los últimos bytes. Si la huella coincide, solo parsea lo añadido; si no
+//! (archivo reescrito), relee todo. Cada harness aporta su analizador de líneas
+//! (ver `crate::harness`).
 
-use std::borrow::Cow;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
+
+use crate::harness::Harness;
 
 const FINGERPRINT_LEN: u64 = 128;
 const MAX_TEXT: usize = 280;
@@ -36,9 +37,15 @@ pub struct PeerLink {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct SessionMeta {
+    /// Harness al que pertenece la sesión.
+    #[serde(default)]
+    pub harness: Harness,
     pub id: String,
+    /// Archivo de la sesión o, si el harness usa una base de datos, la base.
     pub file: PathBuf,
+    /// Tamaño del archivo de la sesión (0 si no tiene archivo propio).
     pub size: u64,
+    /// Última actividad.
     pub mtime_ms: i64,
     /// Byte siguiente a la última línea completa leída.
     pub indexed_to: u64,
@@ -51,12 +58,26 @@ pub struct SessionMeta {
     pub first_prompt: Option<String>,
     pub last_prompt: Option<String>,
     pub git_branch: Option<String>,
+    /// Superficie desde la que se creó: `cli`, `vscode`, `desktop`… (Claude
+    /// guarda sus propios nombres: `claude-vscode`, `claude-desktop`).
     pub entrypoint: Option<String>,
     pub started_ms: Option<i64>,
     pub pr_number: Option<u64>,
+    /// Modelo con el que trabaja la sesión, si el harness lo registra.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Prompts humanos (sin tool results ni mensajes de sistema).
     pub prompts: u32,
     pub has_messages: bool,
+    /// Sesión que no se lista (subagente, hilo hijo, archivada…). Se conserva
+    /// en el índice para no releer su archivo en cada pasada.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+    /// Según lo último que guardó el harness, hay un turno en curso. Solo
+    /// cuenta para sesiones abiertas: si el proceso murió a medias, se queda
+    /// así. Claude no lo usa (publica su estado aparte).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub busy: bool,
     /// Mensajes con otras sesiones (máximo `MAX_LINKS`, del más viejo al más nuevo).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<PeerLink>,
@@ -75,94 +96,9 @@ impl SessionMeta {
     }
 }
 
-#[derive(Deserialize)]
-struct Line<'a> {
-    #[serde(rename = "type", borrow)]
-    kind: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    cwd: Option<Cow<'a, str>>,
-    #[serde(rename = "gitBranch", borrow)]
-    git_branch: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    timestamp: Option<Cow<'a, str>>,
-    #[serde(borrow)]
-    entrypoint: Option<Cow<'a, str>>,
-    #[serde(rename = "isMeta")]
-    is_meta: Option<bool>,
-    #[serde(rename = "isSidechain")]
-    is_sidechain: Option<bool>,
-    #[serde(rename = "isCompactSummary")]
-    is_compact_summary: Option<bool>,
-    #[serde(rename = "toolUseResult")]
-    tool_use_result: Option<IgnoredAny>,
-    #[serde(borrow)]
-    message: Option<&'a RawValue>,
-    #[serde(rename = "customTitle")]
-    custom_title: Option<String>,
-    #[serde(rename = "aiTitle")]
-    ai_title: Option<String>,
-    #[serde(rename = "agentName")]
-    agent_name: Option<String>,
-    #[serde(rename = "lastPrompt")]
-    last_prompt: Option<String>,
-    #[serde(rename = "prNumber")]
-    pr_number: Option<u64>,
-    origin: Option<Origin>,
-}
-
-/// `origin` de un mensaje recibido de otra sesión (`kind = "peer"`).
-#[derive(Deserialize)]
-struct Origin {
-    kind: Option<String>,
-    from: Option<String>,
-    name: Option<String>,
-    msg_id: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ToolMessage<'a> {
-    #[serde(borrow)]
-    content: Option<Vec<ToolBlock<'a>>>,
-}
-
-#[derive(Deserialize)]
-struct ToolBlock<'a> {
-    #[serde(rename = "type", borrow)]
-    kind: Cow<'a, str>,
-    #[serde(borrow)]
-    name: Option<Cow<'a, str>>,
-    input: Option<SendInput>,
-}
-
-/// Entrada de la herramienta `SendMessage` (solo los campos de destino).
-#[derive(Deserialize)]
-struct SendInput {
-    to: Option<String>,
-    recipient: Option<String>,
-    recipient_kind: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct Message {
-    content: Option<Content>,
-}
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Content {
-    Text(String),
-    Blocks(Vec<Block>),
-}
-
-#[derive(Deserialize)]
-struct Block {
-    #[serde(rename = "type")]
-    kind: String,
-    text: Option<String>,
-}
-
-/// Tipos de línea `{"type":"..."}` que interesan; el resto se salta sin parsear.
-const WANTED: [&str; 7] = ["custom-title", "ai-title", "agent-name", "last-prompt", "pr-link", "user", "assistant"];
+/// Analizador de un harness: recibe cada línea completa (sin salto de línea) y
+/// actualiza la sesión.
+pub type LineFn = fn(&[u8], &mut SessionMeta);
 
 fn fnv1a(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -173,7 +109,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     h
 }
 
-fn mtime_ms(md: &std::fs::Metadata) -> i64 {
+pub fn mtime_ms(md: &std::fs::Metadata) -> i64 {
     md.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -181,8 +117,10 @@ fn mtime_ms(md: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-/// Indexa (o actualiza) una sesión. `prev` es la entrada del índice anterior.
-pub fn index_file(path: &Path, prev: Option<&SessionMeta>) -> std::io::Result<SessionMeta> {
+/// Indexa (o actualiza) un `.jsonl` de sesión. `prev` es la entrada del índice
+/// anterior. El id inicial es el nombre del archivo sin extensión; `on_line`
+/// puede cambiarlo si el harness lo guarda dentro.
+pub fn index_jsonl(path: &Path, prev: Option<&SessionMeta>, harness: Harness, on_line: LineFn) -> std::io::Result<SessionMeta> {
     let md = std::fs::metadata(path)?;
     let size = md.len();
     let mtime = mtime_ms(&md);
@@ -192,7 +130,6 @@ pub fn index_file(path: &Path, prev: Option<&SessionMeta>) -> std::io::Result<Se
         }
 
     let mut file = File::open(path)?;
-    let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
 
     // Incremental: solo si el archivo creció y el final ya indexado no cambió.
     if let Some(p) = prev.filter(|p| p.indexed_to > 0 && size >= p.indexed_to && p.file == path) {
@@ -205,7 +142,7 @@ pub fn index_file(path: &Path, prev: Option<&SessionMeta>) -> std::io::Result<Se
             let mut meta = p.clone();
             meta.size = size;
             meta.mtime_ms = mtime;
-            let consumed = parse_lines(&buf[fp_len..], &mut meta);
+            let consumed = parse_lines(&buf[fp_len..], &mut meta, on_line);
             advance(&mut meta, &buf, fp_len + consumed, fp_start);
             return Ok(meta);
         }
@@ -214,8 +151,9 @@ pub fn index_file(path: &Path, prev: Option<&SessionMeta>) -> std::io::Result<Se
 
     let mut buf = Vec::with_capacity(size as usize);
     file.read_to_end(&mut buf)?;
-    let mut meta = SessionMeta { id, file: path.to_path_buf(), size, mtime_ms: mtime, ..Default::default() };
-    let consumed = parse_lines(&buf, &mut meta);
+    let id = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let mut meta = SessionMeta { harness, id, file: path.to_path_buf(), size, mtime_ms: mtime, ..Default::default() };
+    let consumed = parse_lines(&buf, &mut meta, on_line);
     advance(&mut meta, &buf, consumed, 0);
     Ok(meta)
 }
@@ -229,8 +167,8 @@ fn advance(meta: &mut SessionMeta, buf: &[u8], end: usize, base: u64) {
     meta.fingerprint = fnv1a(&buf[end.saturating_sub(k)..end]);
 }
 
-/// Parsea líneas completas de `buf`; devuelve los bytes consumidos.
-fn parse_lines(buf: &[u8], meta: &mut SessionMeta) -> usize {
+/// Pasa a `on_line` las líneas completas de `buf`; devuelve los bytes consumidos.
+fn parse_lines(buf: &[u8], meta: &mut SessionMeta, on_line: LineFn) -> usize {
     let mut pos = 0;
     while let Some(nl) = memchr::memchr(b'\n', &buf[pos..]) {
         let line = &buf[pos..pos + nl];
@@ -239,128 +177,12 @@ fn parse_lines(buf: &[u8], meta: &mut SessionMeta) -> usize {
         if line.len() < 2 {
             continue;
         }
-        if let Some(rest) = line.strip_prefix(b"{\"type\":\"") {
-            let end = memchr::memchr(b'"', rest).unwrap_or(0);
-            let kind = &rest[..end];
-            if !WANTED.iter().any(|w| w.as_bytes() == kind) {
-                continue;
-            }
-        }
-        let Ok(l) = serde_json::from_slice::<Line>(line) else { continue };
-        let sends = memchr::memmem::find(line, b"\"SendMessage\"").is_some();
-        apply(l, meta, sends);
+        on_line(line, meta);
     }
     pos
 }
 
-fn apply(l: Line, meta: &mut SessionMeta, sends: bool) {
-    let kind = l.kind.as_deref().unwrap_or("");
-    match kind {
-        "custom-title" => set_text(&mut meta.custom_title, l.custom_title),
-        "ai-title" => set_text(&mut meta.ai_title, l.ai_title),
-        "agent-name" => set_text(&mut meta.agent_name, l.agent_name),
-        "last-prompt" => {
-            if let Some(p) = l.last_prompt.as_deref().and_then(clean_prompt) {
-                meta.last_prompt = Some(p);
-            }
-        }
-        "pr-link"
-            if l.pr_number.is_some() => {
-                meta.pr_number = l.pr_number;
-            }
-        _ => {}
-    }
-    if l.is_sidechain == Some(true) {
-        return;
-    }
-    let is_message = kind == "user" || kind == "assistant";
-    if let Some(cwd) = l.cwd.as_deref().filter(|c| !c.is_empty())
-        && meta.cwd.as_deref() != Some(cwd) {
-            meta.cwd = Some(cwd.to_string());
-        }
-    if let Some(b) = l.git_branch.as_deref().filter(|b| !b.is_empty() && *b != "HEAD")
-        && meta.git_branch.as_deref() != Some(b) {
-            meta.git_branch = Some(b.to_string());
-        }
-    if !is_message {
-        return;
-    }
-    meta.has_messages = true;
-    let ts_ms = || l.timestamp.as_deref().and_then(|t| t.parse::<jiff::Timestamp>().ok()).map(|t| t.as_millisecond());
-    if let Some(o) = l.origin.as_ref().filter(|o| o.kind.as_deref() == Some("peer"))
-        && let (Some(from), Some(ts)) = (o.from.as_deref().filter(|f| !f.is_empty()), ts_ms())
-        && o.msg_id.as_ref().is_none_or(|id| !meta.links.iter().any(|x| x.id.as_ref() == Some(id)))
-    {
-        push_link(meta, PeerLink { out: false, peer: from.to_string(), name: o.name.clone(), id: o.msg_id.clone(), ts_ms: ts });
-    }
-    if kind == "assistant"
-        && sends
-        && let Some(ts) = ts_ms()
-        && let Some(raw) = l.message
-        && let Ok(msg) = serde_json::from_str::<ToolMessage>(raw.get())
-    {
-        for b in msg.content.unwrap_or_default() {
-            if b.kind != "tool_use" || b.name.as_deref() != Some("SendMessage") {
-                continue;
-            }
-            let Some(input) = b.input else { continue };
-            if input.recipient_kind.as_deref() == Some("agent") {
-                continue;
-            }
-            let Some(to) = input.to.or(input.recipient).map(|t| t.trim().to_string()) else { continue };
-            if to.is_empty() || to == "*" || is_agent_id(&to) {
-                continue;
-            }
-            push_link(meta, PeerLink { out: true, peer: to, name: None, id: None, ts_ms: ts });
-        }
-    }
-    if meta.entrypoint.is_none() {
-        meta.entrypoint = l.entrypoint.map(Cow::into_owned);
-    }
-    if meta.started_ms.is_none() {
-        meta.started_ms = l
-            .timestamp
-            .as_deref()
-            .and_then(|t| t.parse::<jiff::Timestamp>().ok())
-            .map(|t| t.as_millisecond());
-    }
-    if kind != "user" || l.tool_use_result.is_some() || l.is_meta == Some(true) || l.is_compact_summary == Some(true) {
-        return;
-    }
-    let Some(raw) = l.message else { return };
-    let Ok(msg) = serde_json::from_str::<Message>(raw.get()) else { return };
-    let text = match msg.content {
-        Some(Content::Text(t)) => t,
-        Some(Content::Blocks(blocks)) => {
-            if blocks.iter().any(|b| b.kind == "tool_result") {
-                return;
-            }
-            let mut out = String::new();
-            for b in blocks {
-                match (b.kind.as_str(), b.text) {
-                    ("text", Some(t)) => {
-                        if !out.is_empty() {
-                            out.push(' ');
-                        }
-                        out.push_str(&t);
-                    }
-                    ("image", _) => out.push_str(" [imagen]"),
-                    _ => {}
-                }
-            }
-            out
-        }
-        None => return,
-    };
-    if let Some(p) = clean_prompt(&text) {
-        meta.prompts += 1;
-        if meta.first_prompt.is_none() {
-            meta.first_prompt = Some(p);
-        }
-    }
-}
-
-fn push_link(meta: &mut SessionMeta, link: PeerLink) {
+pub fn push_link(meta: &mut SessionMeta, link: PeerLink) {
     meta.links.push(link);
     if meta.links.len() > MAX_LINKS {
         let extra = meta.links.len() - MAX_LINKS;
@@ -368,12 +190,7 @@ fn push_link(meta: &mut SessionMeta, link: PeerLink) {
     }
 }
 
-/// Id de subagente (`a` + 16 hex): mensajes internos de la sesión, no entre sesiones.
-fn is_agent_id(s: &str) -> bool {
-    s.len() == 17 && s.starts_with('a') && s[1..].bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn set_text(slot: &mut Option<String>, value: Option<String>) {
+pub fn set_text(slot: &mut Option<String>, value: Option<String>) {
     if let Some(v) = value.map(|v| collapse(&v)).filter(|v| !v.is_empty()) {
         *slot = Some(v);
     }
@@ -408,7 +225,7 @@ pub fn clean_prompt(text: &str) -> Option<String> {
 }
 
 /// Colapsa espacios y recorta a `MAX_TEXT` caracteres.
-fn collapse(s: &str) -> String {
+pub fn collapse(s: &str) -> String {
     let mut out = String::with_capacity(s.len().min(MAX_TEXT + 4));
     let mut count = 0;
     for word in s.split_whitespace() {
@@ -428,35 +245,20 @@ fn collapse(s: &str) -> String {
     out
 }
 
-/// Lista los `.jsonl` de primer nivel de cada carpeta de proyecto.
-pub fn list_session_files(projects: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let Ok(dirs) = std::fs::read_dir(projects) else {
-        crate::warn_log!("no se pudo leer {}", projects.display());
-        return out;
-    };
-    for dir in dirs.flatten() {
-        if !dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let Ok(files) = std::fs::read_dir(dir.path()) else { continue };
-        for f in files.flatten() {
-            let p = f.path();
-            let is_jsonl = p.extension().is_some_and(|e| e.eq_ignore_ascii_case("jsonl"));
-            if is_jsonl && f.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                out.push(p);
-            }
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
 
-    fn write_tmp(name: &str, content: &str) -> PathBuf {
+    /// Analizador de prueba: cuenta líneas y toma el id de `id=…`.
+    fn count_lines(line: &[u8], meta: &mut SessionMeta) {
+        meta.prompts += 1;
+        if let Some(id) = line.strip_prefix(b"id=") {
+            meta.id = String::from_utf8_lossy(id).into_owned();
+        }
+    }
+
+    fn tmp(name: &str, content: &str) -> PathBuf {
         let dir = std::env::temp_dir().join("claunch-tests");
         std::fs::create_dir_all(&dir).unwrap();
         let p = dir.join(name);
@@ -464,87 +266,34 @@ mod tests {
         p
     }
 
-    const USER: &str = r#"{"parentUuid":null,"isSidechain":false,"type":"user","timestamp":"2026-11-02T14:44:11.943Z","entrypoint":"claude-vscode","cwd":"c:\\Users\\X\\repo","gitBranch":"main","message":{"role":"user","content":"hola   mundo"}}"#;
-    const TOOL: &str = r#"{"parentUuid":"a","isSidechain":false,"type":"user","cwd":"c:\\Users\\X\\repo","toolUseResult":{"x":1},"message":{"role":"user","content":[{"type":"tool_result","content":"x"}]}}"#;
-    const CMD: &str = r#"{"parentUuid":"b","type":"user","cwd":"c:\\Users\\X\\repo","message":{"role":"user","content":"<command-name>/model</command-name>\n<command-args>opus</command-args>"}}"#;
-    const AI: &str = r#"{"type":"ai-title","aiTitle":"Título IA","sessionId":"s"}"#;
-    const CUSTOM: &str = r#"{"type":"custom-title","customTitle":"Mi nombre","sessionId":"s"}"#;
-    const BLOB: &str = r#"{"type":"api-request-blob","data":"{\"type\":\"user\"}"}"#;
-
     #[test]
-    fn parses_metadata_and_prompts() {
-        let content = format!("{USER}\n{TOOL}\n{BLOB}\n{AI}\n{CMD}\n");
-        let p = write_tmp("a1.jsonl", &content);
-        let m = index_file(&p, None).unwrap();
-        assert_eq!(m.cwd.as_deref(), Some(r"c:\Users\X\repo"));
-        assert_eq!(m.first_prompt.as_deref(), Some("hola mundo"));
-        assert_eq!(m.prompts, 2);
-        assert_eq!(m.ai_title.as_deref(), Some("Título IA"));
-        assert_eq!(m.title(), "Título IA");
-        assert_eq!(m.entrypoint.as_deref(), Some("claude-vscode"));
-        assert_eq!(m.git_branch.as_deref(), Some("main"));
-        assert!(m.started_ms.is_some());
-        assert_eq!(m.indexed_to, content.len() as u64);
-    }
+    fn index_is_incremental_and_tags_the_harness() {
+        let p = tmp("generico.jsonl", "id=abc\r\nuno\n\ndos\nsin terminar");
+        let m1 = index_jsonl(&p, None, Harness::Pi, count_lines).unwrap();
+        assert_eq!(m1.harness, Harness::Pi);
+        assert_eq!(m1.id, "abc");
+        // La línea vacía y la que no termina en salto no cuentan.
+        assert_eq!(m1.prompts, 3);
+        assert_eq!(m1.indexed_to, "id=abc\r\nuno\n\ndos\n".len() as u64);
 
-    #[test]
-    fn incremental_append_matches_full() {
-        let first = format!("{USER}\n{AI}\n");
-        let p = write_tmp("a2.jsonl", &first);
-        let m1 = index_file(&p, None).unwrap();
+        // Sin cambios devuelve lo anterior tal cual.
+        assert_eq!(index_jsonl(&p, Some(&m1), Harness::Pi, count_lines).unwrap(), m1);
+
         let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
-        write!(f, "{CUSTOM}\n{CMD}\n").unwrap();
+        writeln!(f, " ahora sí\ntres").unwrap();
         drop(f);
-        // Fuerza mtime distinto aunque el FS tenga poca resolución.
         let mut stale = m1.clone();
         stale.mtime_ms -= 1;
-        let inc = index_file(&p, Some(&stale)).unwrap();
-        let full = index_file(&p, None).unwrap();
-        assert_eq!(inc.title(), "Mi nombre");
-        assert_eq!(inc.prompts, full.prompts);
-        assert_eq!(inc.indexed_to, full.indexed_to);
-        assert_eq!(inc.fingerprint, full.fingerprint);
-        assert_eq!(inc.first_prompt, full.first_prompt);
+        let inc = index_jsonl(&p, Some(&stale), Harness::Pi, count_lines).unwrap();
+        let full = index_jsonl(&p, None, Harness::Pi, count_lines).unwrap();
+        assert_eq!(inc.prompts, 5);
+        assert_eq!(inc, full);
     }
 
     #[test]
-    fn rewritten_file_triggers_full_reindex() {
-        let p = write_tmp("a3.jsonl", &format!("{USER}\n{AI}\n"));
-        let m1 = index_file(&p, None).unwrap();
-        std::fs::write(&p, format!("{CUSTOM}\n{USER}\n{USER}\n")).unwrap();
-        let mut stale = m1.clone();
-        stale.mtime_ms -= 1;
-        let m2 = index_file(&p, Some(&stale)).unwrap();
-        assert_eq!(m2.ai_title, None);
-        assert_eq!(m2.title(), "Mi nombre");
-        assert_eq!(m2.prompts, 2);
-    }
-
-    #[test]
-    fn partial_last_line_is_left_for_later() {
-        let content = format!("{USER}\n{{\"type\":\"ai-title\",\"aiTi");
-        let p = write_tmp("a4.jsonl", &content);
-        let m = index_file(&p, None).unwrap();
-        assert_eq!(m.indexed_to, USER.len() as u64 + 1);
-        assert_eq!(m.ai_title, None);
-    }
-
-    const PEER_IN: &str = r#"{"type":"user","isMeta":true,"timestamp":"2026-11-04T15:30:31.739Z","cwd":"c:/Users/X/repo","message":{"role":"user","content":"x"},"origin":{"kind":"peer","from":"uds:cc-msg-1","name":"Otra","msg_id":"m1","body":"hola"}}"#;
-    const PEER_OUT: &str = r#"{"type":"assistant","timestamp":"2026-11-04T15:31:00.000Z","cwd":"c:/Users/X/repo","message":{"role":"assistant","content":[{"type":"text","text":"ok"},{"type":"tool_use","id":"t1","name":"SendMessage","input":{"to":"bridge:session_01ABC","message":"hola","recipient_kind":"session"}},{"type":"tool_use","id":"t2","name":"SendMessage","input":{"to":"a9c576fceb902380d","message":"x"}}]}}"#;
-
-    #[test]
-    fn captures_peer_links() {
-        let content = format!("{USER}\n{PEER_IN}\n{PEER_IN}\n{PEER_OUT}\n");
-        let p = write_tmp("a5.jsonl", &content);
-        let m = index_file(&p, None).unwrap();
-        assert_eq!(m.links.len(), 2, "{:?}", m.links);
-        assert!(!m.links[0].out);
-        assert_eq!(m.links[0].peer, "uds:cc-msg-1");
-        assert_eq!(m.links[0].name.as_deref(), Some("Otra"));
-        assert!(m.links[1].out);
-        assert_eq!(m.links[1].peer, "bridge:session_01ABC");
-        // Los mensajes de sistema no cuentan como prompts.
-        assert_eq!(m.prompts, 1);
+    fn id_defaults_to_file_stem() {
+        let p = tmp("0f6c2b1e.jsonl", "uno\n");
+        assert_eq!(index_jsonl(&p, None, Harness::Codex, count_lines).unwrap().id, "0f6c2b1e");
     }
 
     #[test]
@@ -552,5 +301,17 @@ mod tests {
         assert_eq!(clean_prompt("<local-command-stdout>x</local-command-stdout>"), None);
         assert_eq!(clean_prompt("<bash-input>ls -la</bash-input>").as_deref(), Some("! ls -la"));
         assert_eq!(clean_prompt("  a\n\nb ").as_deref(), Some("a b"));
+    }
+
+    #[test]
+    fn old_index_entries_default_to_claude() {
+        let m: SessionMeta = serde_json::from_str(
+            r#"{"id":"s","file":"s.jsonl","size":1,"mtime_ms":2,"indexed_to":0,"fingerprint":0,"cwd":null,"custom_title":null,
+                "ai_title":null,"agent_name":null,"first_prompt":null,"last_prompt":null,"git_branch":null,"entrypoint":null,
+                "started_ms":null,"pr_number":null,"prompts":0,"has_messages":false}"#,
+        )
+        .unwrap();
+        assert_eq!(m.harness, Harness::Claude);
+        assert_eq!(m.model, None);
     }
 }

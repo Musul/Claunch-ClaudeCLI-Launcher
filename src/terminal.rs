@@ -290,7 +290,8 @@ mod tests {
     fn item(title: &str, cwd: &str) -> LaunchItem {
         LaunchItem {
             cwd: PathBuf::from(cwd),
-            claude_args: vec![],
+            harness: crate::harness::Harness::Claude,
+            args: vec![],
             title: title.into(),
             label: "app".into(),
             shell: Shell::GitBash,

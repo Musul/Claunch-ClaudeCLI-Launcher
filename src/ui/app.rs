@@ -16,7 +16,8 @@ use crate::config::{Config, LaunchOptions, SessionRef, SessionSet, SetEntry, Set
 use crate::data::graph::{self, Graph};
 use crate::data::{Aliases, Catalog, LiveSession, UsageState, WorkerCmd};
 use crate::claude_settings::{self, BypassStatus};
-use crate::launch::{self, Env, LaunchItem, Mode, Placement};
+use crate::harness::{Harness, ModelInput};
+use crate::launch::{Env, LaunchItem, Mode, Placement};
 use crate::{paths, util};
 
 // ---------------------------------------------------------------- tipos
@@ -120,10 +121,12 @@ pub enum EdRow {
     Open,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FieldId {
     Target,
     Shell,
+    /// Agente con el que se abre una sesión nueva.
+    Harness,
     Mode,
     Model,
     Permission,
@@ -131,6 +134,13 @@ pub enum FieldId {
     Worktree,
     Title,
     Color,
+}
+
+impl FieldId {
+    /// Campos que cambian con el harness (se rehacen al elegir otro agente).
+    fn depends_on_harness(self) -> bool {
+        matches!(self, FieldId::Mode | FieldId::Model | FieldId::Permission | FieldId::Name | FieldId::Worktree)
+    }
 }
 
 pub enum FieldKind {
@@ -142,15 +152,17 @@ pub struct Field {
     pub id: FieldId,
     pub label: &'static str,
     pub kind: FieldKind,
+    /// Ayuda de cada opción de un ciclo, en su mismo orden (vacío: la del campo).
+    pub hints: Vec<&'static str>,
 }
 
 impl Field {
     fn cycle(id: FieldId, label: &'static str, opts: Vec<(String, String)>, current: &str) -> Field {
         let idx = opts.iter().position(|(v, _)| v == current).unwrap_or(0);
-        Field { id, label, kind: FieldKind::Cycle { opts, idx } }
+        Field { id, label, kind: FieldKind::Cycle { opts, idx }, hints: Vec::new() }
     }
     fn text(id: FieldId, label: &'static str, value: &str, placeholder: &str) -> Field {
-        Field { id, label, kind: FieldKind::Text { input: TextInput::new(value), placeholder: placeholder.into() } }
+        Field { id, label, kind: FieldKind::Text { input: TextInput::new(value), placeholder: placeholder.into() }, hints: Vec::new() }
     }
     pub fn value(&self) -> String {
         match &self.kind {
@@ -160,17 +172,18 @@ impl Field {
     }
     /// Texto de ayuda del valor actual.
     pub fn hint(&self) -> &'static str {
+        if let FieldKind::Cycle { idx, .. } = &self.kind
+            && let Some(h) = self.hints.get(*idx) {
+                return h;
+            }
         let v = self.value();
         match (self.id, v.as_str()) {
             (FieldId::Mode, "fork") => "copia nueva; la original queda intacta",
             (FieldId::Mode, _) => "continúa la misma sesión",
-            (FieldId::Permission, "plan") => "solo planifica, no edita",
-            (FieldId::Permission, "acceptEdits") => "acepta ediciones sin preguntar",
-            (FieldId::Permission, "bypassPermissions") => "sin preguntas de permisos",
-            (FieldId::Permission, "manual") => "pregunta antes de actuar",
-            (FieldId::Target, "here") => "reemplaza esta TUI hasta salir de Claude",
-            (FieldId::Name, _) => "-n: nombre visible en /resume",
-            (FieldId::Worktree, _) => "-w: crea un git worktree aislado",
+            (FieldId::Target, "here") => "reemplaza esta TUI hasta salir de la sesión",
+            (FieldId::Harness, _) => "agente con el que se abre",
+            (FieldId::Name, _) => "nombre visible de la sesión",
+            (FieldId::Worktree, _) => "crea un git worktree aislado",
             (FieldId::Title, _) => "título fijo de la pestaña",
             _ => "",
         }
@@ -179,7 +192,8 @@ impl Field {
 
 /// Qué se abre o se guarda desde el modal de opciones.
 pub enum OptPurpose {
-    Launch { cwd: PathBuf, label: String, title: String, existing: Option<String> },
+    /// `existing`: id de la sesión que se reanuda o bifurca; `file`, su archivo.
+    Launch { cwd: PathBuf, label: String, title: String, existing: Option<String>, file: Option<PathBuf> },
     Entry { ctx: PickCtx, repo: String, cwd: Option<String>, session: SessionRef },
 }
 
@@ -189,6 +203,8 @@ pub struct OptionsModal {
     pub sub: String,
     pub fields: Vec<Field>,
     pub focus: usize,
+    /// Harness de la sesión: el suyo si ya existe; si es nueva, el del campo «Agente».
+    pub harness: Harness,
 }
 
 impl OptionsModal {
@@ -219,28 +235,31 @@ impl OptionsModal {
             _ => Target::Tab,
         }
     }
-    /// Vista previa del comando (`claude …`).
+    /// Vista previa del comando (`claude …`, `codex …`).
     pub fn preview(&self) -> String {
         let opts = self.options();
-        let mode = match &self.purpose {
-            OptPurpose::Launch { existing: Some(id), .. } => {
-                if opts.fork { Mode::Fork(id.clone()) } else { Mode::Resume(id.clone()) }
+        let (mode, file) = match &self.purpose {
+            OptPurpose::Launch { existing: Some(id), file, .. } => {
+                (if opts.fork { Mode::Fork(id.clone()) } else { Mode::Resume(id.clone()) }, file.as_deref())
             }
-            OptPurpose::Launch { existing: None, .. } => Mode::New,
-            OptPurpose::Entry { session: SessionRef::New, .. } => Mode::New,
+            OptPurpose::Launch { existing: None, .. } => (Mode::New, None),
+            OptPurpose::Entry { session: SessionRef::New, .. } => (Mode::New, None),
             OptPurpose::Entry { session: SessionRef::Latest, .. } => {
-                if opts.fork { Mode::Fork("<última>".into()) } else { Mode::Resume("<última>".into()) }
+                (if opts.fork { Mode::Fork("<última>".into()) } else { Mode::Resume("<última>".into()) }, None)
             }
             OptPurpose::Entry { session: SessionRef::Id(id), .. } => {
-                if opts.fork { Mode::Fork(id.clone()) } else { Mode::Resume(id.clone()) }
+                (if opts.fork { Mode::Fork(id.clone()) } else { Mode::Resume(id.clone()) }, None)
             }
         };
-        let (args, _) = launch::claude_args(&mode, &opts);
-        let mut out = String::from("claude");
-        let it = args.into_iter().peekable();
-        for a in it {
-            let shown = if a.len() == 36 && a.chars().filter(|c| *c == '-').count() == 4 {
+        let (args, _) = self.harness.args(&mode, &opts, file);
+        let mut out = String::from(self.harness.info().program);
+        for a in args {
+            let shown = if a.len() == 36 && a.is_ascii() && a.chars().filter(|c| *c == '-').count() == 4 {
                 format!("{}…", &a[..8])
+            } else if a.chars().count() > 30 && a.contains(['/', '\\']) {
+                // Ruta larga (archivo de sesión): basta el nombre.
+                let name = a.rsplit(['/', '\\']).next().unwrap_or(&a);
+                format!("…{}{}", paths::SEP, util::truncate(name, 24))
             } else if a.contains(' ') {
                 format!("\"{a}\"")
             } else {
@@ -257,6 +276,9 @@ pub struct Planned {
     pub cwd: PathBuf,
     pub label: String,
     pub title: String,
+    pub harness: Harness,
+    /// Archivo de la sesión que se reanuda o bifurca (ver `Harness::args`).
+    pub file: Option<PathBuf>,
     pub shell: Shell,
     pub tab_color: Option<String>,
     pub fixed_title: bool,
@@ -281,6 +303,27 @@ pub struct GuardModal {
     pub request: LaunchRequest,
     pub conflicts: Vec<Conflict>,
     pub choice: usize,
+    /// Todas las sesiones en conflicto se pueden abrir como fork (depende del harness).
+    pub can_fork: bool,
+}
+
+/// Qué hacer con una sesión que ya está abierta.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GuardChoice {
+    Fork,
+    OpenAnyway,
+    Cancel,
+}
+
+impl GuardModal {
+    /// Opciones que se ofrecen, en orden.
+    pub fn choices(&self) -> &'static [GuardChoice] {
+        if self.can_fork {
+            &[GuardChoice::Fork, GuardChoice::OpenAnyway, GuardChoice::Cancel]
+        } else {
+            &[GuardChoice::OpenAnyway, GuardChoice::Cancel]
+        }
+    }
 }
 
 pub enum ConfirmAction {
@@ -350,6 +393,8 @@ pub struct App {
     pub progress: Option<(usize, usize)>,
     pub loaded: bool,
     pub home: HomeState,
+    /// Agente de «Nueva sesión» (⇥ lo cambia); ver `new_session_harness`.
+    pub new_harness: Harness,
     pub stack: Vec<Screen>,
     pub modal: Option<Modal>,
     pub toasts: Vec<Toast>,
@@ -378,10 +423,11 @@ pub struct App {
 
 impl App {
     pub fn new(cfg: Config, cfg_error: Option<String>, worker: Option<Sender<WorkerCmd>>) -> App {
-        let env = Env::resolve(&cfg.general).map_err(|e| format!("{e:#}"));
+        let env = Env::resolve(&cfg).map_err(|e| format!("{e:#}"));
         let animations = cfg.general.animations && std::env::var_os("CLAUNCH_NO_ANIM").is_none();
         let mut app = App {
             env,
+            new_harness: cfg.general.default_harness,
             cfg_error,
             catalog: Arc::new(Catalog::default()),
             live: Arc::new(HashMap::new()),
@@ -422,8 +468,14 @@ impl App {
         if let Some(e) = app.cfg_error.clone() {
             app.toast(ToastKind::Error, format!("{e} — sets en solo lectura"));
         }
-        if let Err(e) = app.env.clone() {
-            app.toast(ToastKind::Error, e);
+        match app.env.clone() {
+            Err(e) => app.toast(ToastKind::Error, e),
+            // Un agente mal configurado no impide usar los demás, pero se avisa.
+            Ok(env) => {
+                for (h, problem) in &env.problems {
+                    app.toast(ToastKind::Error, format!("{} mal configurado: {problem}", h.label()));
+                }
+            }
         }
         app
     }
@@ -499,6 +551,53 @@ impl App {
         self.cfg.general.default_shell
     }
 
+    /// Harness que se pueden lanzar: activos en la config y con ejecutable.
+    pub fn installed(&self) -> Vec<Harness> {
+        self.env.as_ref().map(Env::installed).unwrap_or_default()
+    }
+
+    /// Agente de «Nueva sesión»: el elegido si se puede lanzar; si no, el
+    /// primero disponible (o el elegido, para que el fallo diga cuál falta).
+    pub fn new_session_harness(&self) -> Harness {
+        let installed = self.installed();
+        if installed.is_empty() || installed.contains(&self.new_harness) { self.new_harness } else { installed[0] }
+    }
+
+    /// Palabra con la que el filtro encuentra las sesiones de un harness
+    /// («codex» deja solo las suyas). Con un solo harness no aporta nada.
+    fn harness_word(&self, h: Harness) -> &'static str {
+        if self.catalog.mixed() { h.tag() } else { "" }
+    }
+
+    /// Pasa al agente siguiente (o anterior) para «Nueva sesión».
+    fn cycle_new_harness(&mut self, d: isize) {
+        let installed = self.installed();
+        if installed.len() > 1 {
+            self.new_harness = cycle(&installed, self.new_session_harness(), d);
+        }
+    }
+
+    /// Color de pestaña por defecto para un harness: el de `general.tab_color`
+    /// si el usuario lo cambió; si no, el del harness.
+    pub fn tab_color(&self, h: Harness) -> String {
+        let general = &self.cfg.general.tab_color;
+        if general.eq_ignore_ascii_case(crate::config::DEFAULT_TAB_COLOR) { h.info().color.to_string() } else { general.clone() }
+    }
+
+    /// Harness con el que se abrirá una entrada de set: el de su sesión si es
+    /// una concreta (manda sobre lo que diga la entrada); si no, el de la entrada.
+    pub fn entry_harness(&self, e: &SetEntry) -> Harness {
+        match &e.session {
+            SessionRef::Id(id) => self.catalog.session(id).map_or(e.harness, |s| s.meta.harness),
+            _ => e.harness,
+        }
+    }
+
+    /// Color de pestaña de una entrada de set: el suyo o, sin él, el de su harness.
+    pub fn entry_color(&self, e: &SetEntry) -> String {
+        e.tab_color.clone().unwrap_or_else(|| self.tab_color(self.entry_harness(e)))
+    }
+
     // ------------------------------------------------------------ filas
 
     pub fn repo_rows(&self, filter: &str) -> Vec<usize> {
@@ -517,7 +616,8 @@ impl App {
                 break;
             }
             let repo = self.catalog.repo(&s.repo_key).map(|r| r.name.as_str()).unwrap_or("");
-            if filter.is_empty() || util::matches(filter, &format!("{} {} {}", s.meta.title(), repo, s.meta.git_branch.as_deref().unwrap_or(""))) {
+            let hay = format!("{} {} {} {}", s.meta.title(), repo, s.meta.git_branch.as_deref().unwrap_or(""), self.harness_word(s.meta.harness));
+            if filter.is_empty() || util::matches(filter, &hay) {
                 out.push(i);
             }
         }
@@ -544,11 +644,12 @@ impl App {
             for &i in &repo.sessions {
                 let s = &self.catalog.sessions[i];
                 let hay = format!(
-                    "{} {} {} {}",
+                    "{} {} {} {} {}",
                     s.meta.title(),
                     s.meta.git_branch.as_deref().unwrap_or(""),
                     s.meta.last_prompt.as_deref().unwrap_or(""),
-                    s.subpath.as_deref().unwrap_or("")
+                    s.subpath.as_deref().unwrap_or(""),
+                    self.harness_word(s.meta.harness)
                 );
                 if filter.is_empty() || util::matches(filter, &hay) {
                     v.push(SessRow::Session(i));
@@ -673,6 +774,11 @@ impl App {
     fn ask_bypass(&mut self) {
         if self.demo {
             self.toast(ToastKind::Info, "Modo demo: el bypass global no se toca");
+            return;
+        }
+        // El bypass global es un ajuste de Claude Code: sin él no hay nada que cambiar.
+        if !self.installed().contains(&Harness::Claude) && !claude_settings::settings_path().exists() {
+            self.toast(ToastKind::Info, "El bypass global es de Claude Code, que no está instalado");
             return;
         }
         match &self.bypass {
@@ -839,7 +945,7 @@ impl App {
                 if let Some(i) = self.selected_set() {
                     self.open_modal(Modal::Confirm(ConfirmModal {
                         message: format!("¿Borrar el set «{}»?", self.cfg.sets[i].name),
-                        detail: "Solo se borra el set; las sesiones de Claude no se tocan.".into(),
+                        detail: "Solo se borra el set; las sesiones no se tocan.".into(),
                         action: ConfirmAction::DeleteSet(i),
                         yes: false,
                     }));
@@ -921,6 +1027,10 @@ impl App {
             self.toast(ToastKind::Info, "Modo demo: datos de ejemplo");
             return;
         }
+        // También se vuelve a mirar qué agentes hay (por si se instaló uno).
+        if self.dry_run.is_none() {
+            self.env = Env::resolve(&self.cfg).map_err(|e| format!("{e:#}"));
+        }
         if let Some(w) = &self.worker
             && w.send(WorkerCmd::Refresh).is_ok() {
                 self.toast(ToastKind::Info, "Reescaneando repos y sesiones…");
@@ -964,6 +1074,9 @@ impl App {
             KeyCode::Char('?') => self.open_modal(Modal::Help),
             KeyCode::Char('/') => filter.editing = true,
             KeyCode::Char('r') | KeyCode::F(5) => self.refresh(),
+            // Agente de «Nueva sesión».
+            KeyCode::Tab => self.cycle_new_harness(1),
+            KeyCode::BackTab => self.cycle_new_harness(-1),
             KeyCode::Up | KeyCode::Char('k') => list.step(-1, &keys),
             KeyCode::Down | KeyCode::Char('j') => list.step(1, &keys),
             KeyCode::PageUp => list.step(-8, &keys),
@@ -1125,7 +1238,7 @@ impl App {
                     let title = entry_label(&self.cfg.sets[set].entries[i], &self.catalog);
                     self.open_modal(Modal::Confirm(ConfirmModal {
                         message: format!("¿Quitar «{title}» del set?"),
-                        detail: "La sesión de Claude no se borra.".into(),
+                        detail: "La sesión no se borra.".into(),
                         action: ConfirmAction::RemoveEntry(set, i),
                         yes: false,
                     }));
@@ -1185,8 +1298,10 @@ impl App {
     fn edit_entry(&mut self, set: usize, i: usize) {
         let e = self.cfg.sets[set].entries[i].clone();
         let repo_name = self.catalog.repo_for_path(&paths::expand(&e.repo)).map(|r| r.name.clone()).unwrap_or_else(|| folder_name(&e.repo));
-        let default_title = default_entry_title(&repo_name, &e.session, &self.catalog);
-        let modal = self.build_entry_modal(PickCtx { set, replace: Some(i) }, e.repo.clone(), e.cwd.clone(), e.session.clone(), default_title, Some(&e));
+        let harness = self.entry_harness(&e);
+        let default_title = default_entry_title(&repo_name, &e.session, harness, &self.catalog);
+        let ctx = PickCtx { set, replace: Some(i) };
+        let modal = self.build_entry_modal(ctx, e.repo.clone(), e.cwd.clone(), e.session.clone(), harness, default_title, Some(&e));
         self.open_modal(Modal::Options(modal));
     }
 
@@ -1195,26 +1310,29 @@ impl App {
         let Some(repo) = self.catalog.repo(repo_key) else { return };
         let repo_root = repo.root.to_string_lossy().into_owned();
         let repo_name = repo.name.clone();
-        let (session, cwd) = match row {
-            SessRow::New => (SessionRef::New, None),
-            SessRow::Latest => (SessionRef::Latest, None),
+        // Nueva y «última» usan el agente elegido con ⇥ (se puede cambiar en el modal).
+        let (session, cwd, harness) = match row {
+            SessRow::New => (SessionRef::New, None, self.new_session_harness()),
+            SessRow::Latest => (SessionRef::Latest, None, self.new_session_harness()),
             SessRow::Session(i) => {
                 let s = &self.catalog.sessions[i];
                 let cwd = (paths::key(&s.launch_cwd) != repo.key).then(|| s.launch_cwd.to_string_lossy().into_owned());
-                (SessionRef::Id(s.meta.id.clone()), cwd)
+                (SessionRef::Id(s.meta.id.clone()), cwd, s.meta.harness)
             }
         };
-        let default_title = default_entry_title(&repo_name, &session, &self.catalog);
-        let modal = self.build_entry_modal(ctx, repo_root, cwd, session, default_title, None);
+        let default_title = default_entry_title(&repo_name, &session, harness, &self.catalog);
+        let modal = self.build_entry_modal(ctx, repo_root, cwd, session, harness, default_title, None);
         self.open_modal(Modal::Options(modal));
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_entry_modal(
         &self,
         ctx: PickCtx,
         repo: String,
         cwd: Option<String>,
         session: SessionRef,
+        harness: Harness,
         default_title: String,
         existing: Option<&SetEntry>,
     ) -> OptionsModal {
@@ -1223,25 +1341,13 @@ impl App {
         if cfg!(windows) {
             fields.push(shell_field(o.shell.unwrap_or(self.default_shell())));
         }
-        if session != SessionRef::New {
-            fields.push(mode_field(o.fork));
-        }
-        fields.push(model_field(o.model.as_deref().unwrap_or("")));
-        fields.push(permission_field(o.permission_mode.as_deref().unwrap_or("")));
-        if session == SessionRef::New {
-            fields.push(Field::text(FieldId::Name, "Nombre", o.name.as_deref().unwrap_or(""), "opcional"));
-            fields.push(Field::text(FieldId::Worktree, "Worktree", o.worktree.as_deref().unwrap_or(""), "opcional"));
-        }
-        let color = existing.and_then(|e| e.tab_color.clone()).unwrap_or_else(|| self.cfg.general.tab_color.clone());
-        let mut opts: Vec<(String, String)> = super::theme::TAB_COLORS.iter().map(|(h, n)| (h.to_string(), n.to_string())).collect();
-        if !opts.iter().any(|(h, _)| h.eq_ignore_ascii_case(&color)) {
-            opts.insert(0, (color.clone(), color.clone()));
-        }
-        let mut cf = Field::cycle(FieldId::Color, "Color", opts, "");
-        if let FieldKind::Cycle { opts, idx } = &mut cf.kind {
-            *idx = opts.iter().position(|(h, _)| h.eq_ignore_ascii_case(&color)).unwrap_or(0);
-        }
-        fields.push(cf);
+        // El agente se elige para sesiones nuevas y «última»; una sesión concreta ya tiene el suyo.
+        if !matches!(session, SessionRef::Id(_))
+            && let Some(f) = self.harness_field(harness) {
+                fields.push(f);
+            }
+        fields.extend(harness_fields(harness, session != SessionRef::New, &o));
+        fields.push(color_field(&existing.and_then(|e| e.tab_color.clone()).unwrap_or_else(|| self.tab_color(harness))));
         let what = match &session {
             SessionRef::New => "Nueva sesión".to_string(),
             SessionRef::Latest => "Última sesión (al abrir)".to_string(),
@@ -1253,10 +1359,65 @@ impl App {
             purpose: OptPurpose::Entry { ctx, repo, cwd, session },
             fields,
             focus: 0,
+            harness,
         }
     }
 
-    fn launch_fields(&self, existing: bool) -> Vec<Field> {
+    /// Campo «Agente»: los harness que se pueden lanzar (y el actual, aunque
+    /// falte). `None` si no hay nada que elegir.
+    fn harness_field(&self, current: Harness) -> Option<Field> {
+        let mut all = self.installed();
+        if !all.contains(&current) {
+            all.push(current);
+            all.sort();
+        }
+        let opts = all.iter().map(|h| (h.id().to_string(), h.label().to_string())).collect();
+        (all.len() > 1).then(|| Field::cycle(FieldId::Harness, "Agente", opts, current.id()))
+    }
+
+    /// Cambia el harness del modal: rehace los campos que dependen de él y
+    /// conserva el resto (destino, shell, título, nombre…).
+    fn set_modal_harness(&self, m: &mut OptionsModal, h: Harness) {
+        let old_color = self.tab_color(m.harness);
+        m.harness = h;
+        let existing = match &m.purpose {
+            OptPurpose::Launch { existing, .. } => existing.is_some(),
+            OptPurpose::Entry { session, .. } => *session != SessionRef::New,
+        };
+        let old: Vec<Field> = std::mem::take(&mut m.fields);
+        let typed: HashMap<FieldId, String> =
+            old.iter().filter(|f| matches!(f.id, FieldId::Name | FieldId::Worktree)).map(|f| (f.id, f.value())).collect();
+        let mut fresh = harness_fields(h, existing, &LaunchOptions::default());
+        for f in &mut fresh {
+            if let (Some(v), FieldKind::Text { input, .. }) = (typed.get(&f.id), &mut f.kind) {
+                *input = TextInput::new(v);
+            }
+        }
+        let mut fresh = Some(fresh);
+        for f in old {
+            if f.id.depends_on_harness() {
+                continue;
+            }
+            let is_agent = f.id == FieldId::Harness;
+            // El color sigue al harness mientras no se haya elegido otro.
+            let f = if f.id == FieldId::Color && f.value().eq_ignore_ascii_case(&old_color) { color_field(&self.tab_color(h)) } else { f };
+            m.fields.push(f);
+            if is_agent && let Some(fresh) = fresh.take() {
+                m.fields.extend(fresh);
+            }
+        }
+        // El título por defecto de una entrada nombra al agente: también cambia.
+        if let OptPurpose::Entry { repo, session, .. } = &m.purpose {
+            let repo_name = self.catalog.repo_for_path(&paths::expand(repo)).map(|r| r.name.clone()).unwrap_or_else(|| folder_name(repo));
+            let default_title = default_entry_title(&repo_name, session, h, &self.catalog);
+            if let Some(Field { kind: FieldKind::Text { placeholder, .. }, .. }) = m.fields.iter_mut().find(|f| f.id == FieldId::Title) {
+                *placeholder = default_title;
+            }
+        }
+        m.focus = m.fields.iter().position(|f| f.id == FieldId::Harness).unwrap_or(0);
+    }
+
+    fn launch_fields(&self, harness: Harness, existing: bool) -> Vec<Field> {
         let g = &self.cfg.general;
         let target = match g.default_target {
             Target::Tab => "tab",
@@ -1283,21 +1444,19 @@ impl App {
         if cfg!(windows) {
             f.push(shell_field(g.default_shell));
         }
-        if existing {
-            f.push(mode_field(false));
-        }
-        f.push(model_field(""));
-        f.push(permission_field(""));
-        if !existing {
-            f.push(Field::text(FieldId::Name, "Nombre", "", "opcional"));
-            f.push(Field::text(FieldId::Worktree, "Worktree", "", "opcional"));
-        }
+        // El agente solo se elige al crear: una sesión existente ya tiene el suyo.
+        if !existing
+            && let Some(a) = self.harness_field(harness) {
+                f.push(a);
+            }
+        f.extend(harness_fields(harness, existing, &LaunchOptions::default()));
         f
     }
 
     fn options_for_session(&mut self, i: usize) {
         let s = &self.catalog.sessions[i];
         let label = self.catalog.repo(&s.repo_key).map(|r| r.name.clone()).unwrap_or_default();
+        let harness = s.meta.harness;
         let modal = OptionsModal {
             heading: format!("Abrir · {}", util::truncate(s.meta.title(), 40)),
             sub: paths::display(&s.launch_cwd),
@@ -1306,21 +1465,31 @@ impl App {
                 label,
                 title: s.meta.title().to_string(),
                 existing: Some(s.meta.id.clone()),
+                file: Some(s.meta.file.clone()),
             },
-            fields: self.launch_fields(true),
+            fields: self.launch_fields(harness, true),
             focus: 0,
+            harness,
         };
         self.open_modal(Modal::Options(modal));
     }
 
     fn options_for_new(&mut self, repo_key: &str) {
         let Some(r) = self.catalog.repo(repo_key) else { return };
+        let harness = self.new_session_harness();
         let modal = OptionsModal {
             heading: format!("Nueva sesión · {}", util::truncate(&r.name, 40)),
             sub: paths::display(&r.root),
-            purpose: OptPurpose::Launch { cwd: r.root.clone(), label: r.name.clone(), title: format!("{} · nueva", r.name), existing: None },
-            fields: self.launch_fields(false),
+            purpose: OptPurpose::Launch {
+                cwd: r.root.clone(),
+                label: r.name.clone(),
+                title: new_session_title(&r.name, harness),
+                existing: None,
+                file: None,
+            },
+            fields: self.launch_fields(harness, false),
             focus: 0,
+            harness,
         };
         self.open_modal(Modal::Options(modal));
     }
@@ -1352,6 +1521,11 @@ impl App {
                     let len = opts.len();
                     *idx = if key.code == KeyCode::Left { (*idx + len - 1) % len } else { (*idx + 1) % len };
                 }
+                // Otro agente: otros modelos, permisos y opciones.
+                if m.fields[m.focus].id == FieldId::Harness
+                    && let Some(h) = Harness::parse(&m.fields[m.focus].value()) {
+                        self.set_modal_harness(&mut m, h);
+                    }
             }
             _ => {
                 if let FieldKind::Text { input, .. } = &mut m.fields[m.focus].kind {
@@ -1367,8 +1541,9 @@ impl App {
         let target = m.target();
         let entry_title = m.field(FieldId::Title).map(Field::value).filter(|t| !t.is_empty());
         let entry_color = m.field(FieldId::Color).map(Field::value);
+        let harness = m.harness;
         match m.purpose {
-            OptPurpose::Launch { cwd, label, title, existing } => {
+            OptPurpose::Launch { cwd, label, title, existing, file } => {
                 let mode = match existing {
                     Some(id) if opts.fork => Mode::Fork(id),
                     Some(id) => Mode::Resume(id),
@@ -1376,6 +1551,8 @@ impl App {
                 };
                 let title = match (&mode, opts.name.as_deref()) {
                     (Mode::New, Some(n)) => format!("{label} · {n}"),
+                    // El agente pudo cambiar en el modal: el título lo sigue.
+                    (Mode::New, None) => new_session_title(&label, harness),
                     (Mode::Fork(_), _) => format!("{title} (fork)"),
                     _ => title,
                 };
@@ -1383,8 +1560,10 @@ impl App {
                     cwd,
                     label,
                     title,
+                    harness,
+                    file,
                     shell: opts.shell.unwrap_or(self.default_shell()),
-                    tab_color: Some(self.cfg.general.tab_color.clone()),
+                    tab_color: Some(self.tab_color(harness)),
                     fixed_title: false,
                     mode,
                     opts: LaunchOptions { shell: None, ..opts },
@@ -1398,12 +1577,13 @@ impl App {
             }
             OptPurpose::Entry { ctx, repo, cwd, session } => {
                 let title = entry_title;
-                let color = entry_color.filter(|c| !c.eq_ignore_ascii_case(&self.cfg.general.tab_color));
+                // El color por defecto del harness no se guarda: sigue a la config.
+                let color = entry_color.filter(|c| !c.eq_ignore_ascii_case(&self.tab_color(harness)));
                 let mut options = opts;
                 if options.shell == Some(self.default_shell()) {
                     options.shell = None;
                 }
-                let entry = SetEntry { repo, cwd, session, title, tab_color: color, options };
+                let entry = SetEntry { repo, cwd, session, harness, title, tab_color: color, options };
                 let Some(set) = self.cfg.sets.get_mut(ctx.set) else { return };
                 match ctx.replace {
                     Some(i) if i < set.entries.len() => set.entries[i] = entry,
@@ -1427,28 +1607,29 @@ impl App {
     }
 
     fn guard_key(&mut self, mut m: GuardModal, key: KeyEvent) {
+        let choices = m.choices();
         let choice = match key.code {
             KeyCode::Esc | KeyCode::Char('n') => return,
-            KeyCode::Char('f') => 0,
-            KeyCode::Char('a') => 1,
+            KeyCode::Char('f') if m.can_fork => GuardChoice::Fork,
+            KeyCode::Char('a') => GuardChoice::OpenAnyway,
             KeyCode::Up => {
                 m.choice = m.choice.saturating_sub(1);
                 self.modal = Some(Modal::Guard(m));
                 return;
             }
             KeyCode::Down | KeyCode::Tab => {
-                m.choice = (m.choice + 1).min(2);
+                m.choice = (m.choice + 1).min(choices.len() - 1);
                 self.modal = Some(Modal::Guard(m));
                 return;
             }
-            KeyCode::Enter => m.choice,
+            KeyCode::Enter => choices[m.choice.min(choices.len() - 1)],
             _ => {
                 self.modal = Some(Modal::Guard(m));
                 return;
             }
         };
         match choice {
-            0 => {
+            GuardChoice::Fork => {
                 for c in &m.conflicts {
                     let p = &mut m.request.items[c.item];
                     if let Mode::Resume(id) = &p.mode {
@@ -1458,8 +1639,8 @@ impl App {
                 }
                 self.execute(m.request);
             }
-            1 => self.execute(m.request),
-            _ => {}
+            GuardChoice::OpenAnyway => self.execute(m.request),
+            GuardChoice::Cancel => {}
         }
     }
 
@@ -1505,14 +1686,17 @@ impl App {
     fn planned_for_session(&self, i: usize, opts: LaunchOptions) -> Planned {
         let s = &self.catalog.sessions[i];
         let label = self.catalog.repo(&s.repo_key).map(|r| r.name.clone()).unwrap_or_default();
+        let harness = s.meta.harness;
         Planned {
             cwd: s.launch_cwd.clone(),
             label,
             title: s.meta.title().to_string(),
+            harness,
+            file: Some(s.meta.file.clone()),
             shell: opts.shell.unwrap_or(self.default_shell()),
-            tab_color: Some(self.cfg.general.tab_color.clone()),
+            tab_color: Some(self.tab_color(harness)),
             fixed_title: false,
-            mode: if opts.fork { Mode::Fork(s.meta.id.clone()) } else { Mode::Resume(s.meta.id.clone()) },
+            mode: if opts.fork && harness.info().fork { Mode::Fork(s.meta.id.clone()) } else { Mode::Resume(s.meta.id.clone()) },
             opts,
         }
     }
@@ -1542,12 +1726,15 @@ impl App {
             self.toast(ToastKind::Error, format!("La carpeta {} ya no existe", paths::display(&r.root)));
             return;
         }
+        let harness = self.new_session_harness();
         let p = Planned {
             cwd: r.root.clone(),
             label: r.name.clone(),
-            title: format!("{} · nueva", r.name),
+            title: new_session_title(&r.name, harness),
+            harness,
+            file: None,
             shell: self.default_shell(),
-            tab_color: Some(self.cfg.general.tab_color.clone()),
+            tab_color: Some(self.tab_color(harness)),
             fixed_title: false,
             mode: Mode::New,
             opts: LaunchOptions::default(),
@@ -1571,32 +1758,39 @@ impl App {
                 skipped.push(format!("{repo_name} (carpeta no existe)"));
                 continue;
             }
-            let mode = match &e.session {
-                SessionRef::New => Mode::New,
+            // Sesión que se retoma (y su harness, que manda sobre el de la entrada).
+            let found = match &e.session {
+                SessionRef::New => None,
+                // La más reciente de ese harness en la carpeta; si no hay, una nueva.
                 SessionRef::Latest => {
                     let k = paths::key(&dir);
-                    match self.catalog.sessions.iter().find(|x| paths::key(&x.launch_cwd) == k) {
-                        Some(x) if e.options.fork => Mode::Fork(x.meta.id.clone()),
-                        Some(x) => Mode::Resume(x.meta.id.clone()),
-                        None => Mode::New,
-                    }
+                    self.catalog.sessions.iter().find(|x| x.meta.harness == e.harness && paths::key(&x.launch_cwd) == k)
                 }
-                SessionRef::Id(id) => {
-                    if self.catalog.session(id).is_none() {
-                        skipped.push(format!("{repo_name} (sesión {} no encontrada)", &id[..id.len().min(8)]));
+                SessionRef::Id(id) => match self.catalog.session(id) {
+                    Some(x) => Some(x),
+                    None => {
+                        let short: String = id.chars().take(8).collect();
+                        skipped.push(format!("{repo_name} (sesión {short} no encontrada)"));
                         continue;
                     }
-                    if e.options.fork { Mode::Fork(id.clone()) } else { Mode::Resume(id.clone()) }
-                }
+                },
             };
-            let title = e.title.clone().unwrap_or_else(|| default_entry_title(&repo_name, &e.session, &self.catalog));
+            let harness = found.map_or(e.harness, |x| x.meta.harness);
+            let mode = match found {
+                Some(x) if e.options.fork && harness.info().fork => Mode::Fork(x.meta.id.clone()),
+                Some(x) => Mode::Resume(x.meta.id.clone()),
+                None => Mode::New,
+            };
+            let title = e.title.clone().unwrap_or_else(|| default_entry_title(&repo_name, &e.session, harness, &self.catalog));
             items.push(Planned {
                 cwd: dir,
                 label: repo_name,
+                harness,
+                file: found.map(|x| x.meta.file.clone()),
                 fixed_title: e.title.is_some(),
                 title,
                 shell: e.options.shell.unwrap_or(self.default_shell()),
-                tab_color: Some(e.tab_color.clone().unwrap_or_else(|| self.cfg.general.tab_color.clone())),
+                tab_color: Some(e.tab_color.clone().unwrap_or_else(|| self.tab_color(harness))),
                 mode,
                 opts: e.options.clone(),
             });
@@ -1619,17 +1813,20 @@ impl App {
             if let Some(l) = self.live.get(id) {
                 let (surface, _) = super::theme::entrypoint(&l.entrypoint);
                 let state = if l.is_busy() {
-                    "trabajando"
+                    " · trabajando"
                 } else if l.is_waiting() {
-                    "esperando respuesta"
+                    " · esperando respuesta"
+                } else if l.status == "idle" {
+                    " · inactiva"
                 } else {
-                    "inactiva"
+                    // Solo se sabe que el proceso sigue vivo.
+                    ""
                 };
                 let since = util::relative_time(l.started_ms, now);
                 conflicts.push(Conflict {
                     item: i,
                     title: p.title.clone(),
-                    detail: format!("abierta en {} · pid {} · {state} · desde {since}", if surface.is_empty() { "otra superficie" } else { surface }, l.pid),
+                    detail: format!("abierta en {} · pid {}{state} · desde {since}", if surface.is_empty() { "otra superficie" } else { surface }, l.pid),
                 });
             } else if let Some(s) = self.catalog.session(id)
                 && now - s.meta.mtime_ms < RECENT_ACTIVITY_MS {
@@ -1643,7 +1840,9 @@ impl App {
         if conflicts.is_empty() {
             self.execute(req);
         } else {
-            self.open_modal(Modal::Guard(GuardModal { request: req, conflicts, choice: 0 }));
+            // El fork solo se ofrece si todos los harness en conflicto saben bifurcar.
+            let can_fork = conflicts.iter().all(|c| req.items[c.item].harness.info().fork);
+            self.open_modal(Modal::Guard(GuardModal { request: req, conflicts, choice: 0, can_fork }));
         }
     }
 
@@ -1652,10 +1851,11 @@ impl App {
             .items
             .iter()
             .map(|p| {
-                let (claude_args, session_id) = launch::claude_args(&p.mode, &p.opts);
+                let (args, session_id) = p.harness.args(&p.mode, &p.opts, p.file.as_deref());
                 LaunchItem {
-                    cwd: p.cwd.clone(),
-                    claude_args,
+                    cwd: p.harness.launch_cwd(&p.cwd),
+                    harness: p.harness,
+                    args,
                     title: p.title.clone(),
                     label: p.label.clone(),
                     shell: p.shell,
@@ -1679,6 +1879,11 @@ impl App {
                 return;
             }
         };
+        // Un harness sin instalar se avisa antes de abrir nada.
+        if let Some(e) = items.iter().find_map(|it| env.command(it.harness).err()) {
+            self.toast(ToastKind::Error, format!("No se pudo abrir: {e:#}"));
+            return;
+        }
         self.fx.flash = true;
         if req.here {
             self.run_here = items.into_iter().next();
@@ -1821,6 +2026,7 @@ impl App {
                             repo: r.root.to_string_lossy().into_owned(),
                             cwd: None,
                             session: if i == 1 { SessionRef::New } else { SessionRef::Latest },
+                            harness: Harness::Claude,
                             title: None,
                             tab_color: Some(super::theme::TAB_COLORS[i].0.into()),
                             options: LaunchOptions::default(),
@@ -1855,10 +2061,12 @@ impl App {
                     ("guard", Some(i)) => {
                         let p = self.planned_for_session(i, LaunchOptions::default());
                         let title = p.title.clone();
+                        let can_fork = p.harness.info().fork;
                         self.modal = Some(Modal::Guard(GuardModal {
                             request: LaunchRequest { label: title.clone(), items: vec![p], placement: Placement::NewTab, here: false },
                             conflicts: vec![Conflict { item: 0, title, detail: "abierta en VS Code · pid 2372 · inactiva · desde hace 2 h".into() }],
                             choice: 0,
+                            can_fork,
                         }));
                     }
                     _ => {}
@@ -1896,30 +2104,98 @@ fn mode_field(fork: bool) -> Field {
     )
 }
 
-fn model_field(current: &str) -> Field {
-    let opts = ["", "fable", "opus", "sonnet", "haiku"]
-        .iter()
-        .map(|m| (m.to_string(), if m.is_empty() { "por defecto".into() } else { m.to_string() }))
-        .collect();
-    Field::cycle(FieldId::Model, "Modelo", opts, current)
+/// Campos que dependen del harness: modo (reanudar o fork), modelo, permisos
+/// y, para sesiones nuevas, nombre y worktree. Solo los que el harness admite.
+fn harness_fields(h: Harness, existing: bool, o: &LaunchOptions) -> Vec<Field> {
+    let info = h.info();
+    let mut f = Vec::new();
+    if existing && info.fork {
+        f.push(mode_field(o.fork));
+    }
+    f.extend(model_field(h, o.model.as_deref().unwrap_or("")));
+    f.extend(permission_field(h, o.permission_mode.as_deref().unwrap_or("")));
+    if !existing {
+        if info.name {
+            f.push(Field::text(FieldId::Name, "Nombre", o.name.as_deref().unwrap_or(""), "opcional"));
+        }
+        if info.worktree {
+            f.push(Field::text(FieldId::Worktree, "Worktree", o.worktree.as_deref().unwrap_or(""), "opcional"));
+        }
+    }
+    f
 }
 
-fn permission_field(current: &str) -> Field {
-    let opts = ["", "manual", "acceptEdits", "auto", "plan", "dontAsk", "bypassPermissions"]
-        .iter()
-        .map(|m| (m.to_string(), if m.is_empty() { "por defecto".into() } else { m.to_string() }))
-        .collect();
-    Field::cycle(FieldId::Permission, "Permisos", opts, current)
+/// Campo de modelo: lista cerrada, texto libre o nada, según el harness.
+fn model_field(h: Harness, current: &str) -> Option<Field> {
+    match h.info().model {
+        ModelInput::Choice(models) => {
+            let mut opts: Vec<(String, String)> =
+                models.iter().map(|m| (m.to_string(), if m.is_empty() { "por defecto".into() } else { m.to_string() })).collect();
+            // Un modelo escrito a mano en la config no se pierde al editar.
+            if !models.contains(&current) {
+                opts.push((current.to_string(), current.to_string()));
+            }
+            Some(Field::cycle(FieldId::Model, "Modelo", opts, current))
+        }
+        ModelInput::Free(example) => Some(Field::text(FieldId::Model, "Modelo", current, &format!("por defecto · p. ej. {example}"))),
+        ModelInput::None => None,
+    }
+}
+
+/// Campo de permisos con los modos del harness; `None` si solo tiene el de por defecto.
+fn permission_field(h: Harness, current: &str) -> Option<Field> {
+    let perms = h.info().permissions;
+    if perms.len() < 2 {
+        return None;
+    }
+    let mut opts: Vec<(String, String)> = perms.iter().map(|p| (p.value.to_string(), p.label.to_string())).collect();
+    let mut hints: Vec<&'static str> = perms.iter().map(|p| p.hint).collect();
+    if !perms.iter().any(|p| p.value == current) {
+        opts.push((current.to_string(), current.to_string()));
+        hints.push("");
+    }
+    let mut field = Field::cycle(FieldId::Permission, "Permisos", opts, current);
+    field.hints = hints;
+    Some(field)
+}
+
+/// Campo de color de pestaña: la paleta y, si no está en ella, el color actual.
+fn color_field(color: &str) -> Field {
+    let mut opts: Vec<(String, String)> = super::theme::TAB_COLORS.iter().map(|(h, n)| (h.to_string(), n.to_string())).collect();
+    if !opts.iter().any(|(h, _)| h.eq_ignore_ascii_case(color)) {
+        opts.insert(0, (color.to_string(), color.to_string()));
+    }
+    let mut field = Field::cycle(FieldId::Color, "Color", opts, "");
+    if let FieldKind::Cycle { opts, idx } = &mut field.kind {
+        *idx = opts.iter().position(|(h, _)| h.eq_ignore_ascii_case(color)).unwrap_or(0);
+    }
+    field
 }
 
 pub fn folder_name(p: &str) -> String {
     Path::new(p).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| p.to_string())
 }
 
-pub fn default_entry_title(repo_name: &str, session: &SessionRef, catalog: &Catalog) -> String {
+/// «repo» para Claude y «repo · codex» para los demás: así dos pestañas del
+/// mismo repo con agentes distintos no se llaman igual.
+fn repo_and_agent(repo_name: &str, harness: Harness) -> String {
+    match harness {
+        Harness::Claude => repo_name.to_string(),
+        h => format!("{repo_name} · {}", h.tag()),
+    }
+}
+
+/// Título de pestaña de una sesión nueva.
+pub fn new_session_title(repo_name: &str, harness: Harness) -> String {
+    format!("{} · nueva", repo_and_agent(repo_name, harness))
+}
+
+/// Título por defecto de una entrada de set. `harness` es el de la entrada
+/// (para una sesión concreta no cuenta: la nombra su propio título).
+pub fn default_entry_title(repo_name: &str, session: &SessionRef, harness: Harness, catalog: &Catalog) -> String {
     match session {
-        SessionRef::New => format!("{repo_name} · nueva"),
-        SessionRef::Latest => format!("{repo_name} · última"),
+        SessionRef::New => new_session_title(repo_name, harness),
+        SessionRef::Latest => format!("{} · última", repo_and_agent(repo_name, harness)),
         SessionRef::Id(id) => {
             let t = catalog.session(id).map(|s| s.meta.title().to_string()).unwrap_or_else(|| id.chars().take(8).collect());
             format!("{repo_name} · {}", util::truncate(&t, 28))
@@ -1933,7 +2209,7 @@ pub fn entry_label(e: &SetEntry, catalog: &Catalog) -> String {
     }
     let dir = e.launch_dir();
     let repo = catalog.repo_for_path(&dir).map(|r| r.name.clone()).unwrap_or_else(|| folder_name(&e.repo));
-    default_entry_title(&repo, &e.session, catalog)
+    default_entry_title(&repo, &e.session, e.harness, catalog)
 }
 
 #[cfg(test)]
@@ -1953,8 +2229,27 @@ mod tests {
         }
     }
 
-    /// Dos repos: beta (sesión s3, la más reciente) y alpha (s1, s2).
+    /// Entorno de pruebas con estos agentes «instalados», sin mirar el equipo.
+    fn test_env(installed: &[Harness]) -> Env {
+        Env {
+            commands: installed.iter().map(|h| (*h, vec![h.info().program.to_string()])).collect(),
+            problems: Default::default(),
+            git_bash: None,
+            terminal: crate::launch::Terminal::Unavailable,
+            self_exe: PathBuf::from("claunch"),
+            general: crate::config::General::default(),
+        }
+    }
+
+    /// Dos repos: beta (sesión s3, la más reciente) y alpha (s1, s2), con solo
+    /// Claude instalado.
     fn fixture(name: &str) -> (App, PathBuf, PathBuf) {
+        fixture_with(name, &[Harness::Claude], &[])
+    }
+
+    /// Como `fixture`, con estos agentes instalados y sesiones extra:
+    /// (id, harness, en beta, antigüedad en ms, título).
+    fn fixture_with(name: &str, installed: &[Harness], extra: &[(&str, Harness, bool, i64, &str)]) -> (App, PathBuf, PathBuf) {
         let base = std::env::temp_dir().join("claunch-tests").join(name);
         let alpha = base.join("alpha");
         let beta = base.join("beta");
@@ -1962,7 +2257,8 @@ mod tests {
             std::fs::create_dir_all(r.join(".git")).unwrap();
         }
         let now = util::now_ms();
-        let meta = |id: &str, cwd: &Path, age: i64, title: &str| SessionMeta {
+        let meta = |id: &str, harness: Harness, cwd: &Path, age: i64, title: &str| SessionMeta {
+            harness,
             id: id.into(),
             file: base.join(format!("{id}.jsonl")),
             mtime_ms: now - age,
@@ -1972,14 +2268,18 @@ mod tests {
             prompts: 3,
             ..Default::default()
         };
-        let metas = vec![
-            meta("s1", &alpha, 3_600_000, "Primera alfa"),
-            meta("s2", &alpha, 7_200_000, "Segunda alfa"),
-            meta("s3", &beta, 600_000, "Beta reciente"),
+        let mut metas = vec![
+            meta("s1", Harness::Claude, &alpha, 3_600_000, "Primera alfa"),
+            meta("s2", Harness::Claude, &alpha, 7_200_000, "Segunda alfa"),
+            meta("s3", Harness::Claude, &beta, 600_000, "Beta reciente"),
         ];
+        for (id, harness, in_beta, age, title) in extra {
+            metas.push(meta(id, *harness, if *in_beta { &beta } else { &alpha }, *age, title));
+        }
         let mut cfg = Config::default();
         cfg.general.animations = false;
         let mut app = App::new(cfg, None, None);
+        app.env = Ok(test_env(installed));
         app.catalog = Arc::new(Catalog::build(&metas, &[]));
         app.loaded = true;
         app.read_only = true;
@@ -1987,6 +2287,35 @@ mod tests {
         app.toasts.clear();
         app.sync_lists();
         (app, paths::normalize(&alpha), paths::normalize(&beta))
+    }
+
+    /// Los cinco agentes instalados y, además de las de Claude, una sesión de
+    /// Codex en beta (x1, la más reciente de todas) y una de Pi en alpha (p1).
+    fn mixed(name: &str) -> (App, PathBuf, PathBuf) {
+        fixture_with(
+            name,
+            &Harness::ALL,
+            &[("x1", Harness::Codex, true, 300_000, "Codex en beta"), ("p1", Harness::Pi, false, 900_000, "Pi en alfa")],
+        )
+    }
+
+    fn options(app: &App) -> &OptionsModal {
+        match &app.modal {
+            Some(Modal::Options(m)) => m,
+            _ => panic!("se esperaba el modal de opciones"),
+        }
+    }
+
+    /// El modal ofrece exactamente lo que el harness admite.
+    fn assert_fields_match(m: &OptionsModal, h: Harness, existing: bool) {
+        let info = h.info();
+        let has = |id: FieldId| m.fields.iter().any(|f| f.id == id);
+        assert_eq!(has(FieldId::Mode), existing && info.fork, "{}: modo", info.id);
+        assert_eq!(has(FieldId::Model), info.model != ModelInput::None, "{}: modelo", info.id);
+        assert_eq!(has(FieldId::Permission), info.permissions.len() > 1, "{}: permisos", info.id);
+        assert_eq!(has(FieldId::Name), !existing && info.name, "{}: nombre", info.id);
+        assert_eq!(has(FieldId::Worktree), !existing && info.worktree, "{}: worktree", info.id);
+        assert!(m.preview().starts_with(info.program), "{}: {}", info.id, m.preview());
     }
 
     fn launched(app: &App) -> &Vec<(Vec<LaunchItem>, Placement, bool)> {
@@ -2010,7 +2339,7 @@ mod tests {
         app.on_key(key(KeyCode::Enter)); // «Nueva sesión»
         let (items, placement, here) = &launched(&app)[0];
         assert_eq!(items[0].cwd, beta);
-        assert_eq!(items[0].claude_args[0], "--session-id");
+        assert_eq!(items[0].args[0], "--session-id");
         assert_eq!(*placement, Placement::NewTab);
         assert!(!here);
     }
@@ -2030,7 +2359,7 @@ mod tests {
         assert!(matches!(app.modal, Some(Modal::Guard(_))));
         assert!(launched(&app).is_empty());
         app.on_key(ch('f'));
-        assert_eq!(launched(&app)[0].0[0].claude_args, vec!["-r", "s3", "--fork-session"]);
+        assert_eq!(launched(&app)[0].0[0].args, vec!["-r", "s3", "--fork-session"]);
     }
 
     #[test]
@@ -2059,7 +2388,7 @@ mod tests {
         app.on_key(key(KeyCode::Right)); // → fork
         app.on_key(key(KeyCode::Enter));
         let (items, placement, _) = &launched(&app)[0];
-        assert_eq!(items[0].claude_args, vec!["-r", "s3", "--fork-session"]);
+        assert_eq!(items[0].args, vec!["-r", "s3", "--fork-session"]);
         assert_eq!(*placement, Placement::NewWindow);
         assert!(items[0].title.ends_with("(fork)"));
     }
@@ -2091,6 +2420,228 @@ mod tests {
         let (items, placement, _) = &launched(&app)[0];
         assert_eq!(*placement, Placement::Set(SetLayout::Tabs, SetWindow::New));
         assert_eq!(items[0].cwd, beta);
-        assert_eq!(items[0].claude_args, vec!["-r", "s3"]);
+        assert_eq!(items[0].args, vec!["-r", "s3"]);
+        assert_eq!(items[0].harness, Harness::Claude);
+    }
+
+    #[test]
+    fn tab_picks_the_agent_for_new_sessions() {
+        let (mut app, _alpha, beta) = fixture_with("tab-agent", &[Harness::Claude, Harness::Codex, Harness::Pi], &[]);
+        app.on_key(key(KeyCode::Enter)); // entra a beta
+        assert_eq!(app.new_session_harness(), Harness::Claude);
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.new_session_harness(), Harness::Codex);
+        app.on_key(key(KeyCode::Tab));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.new_session_harness(), Harness::Claude, "da la vuelta");
+        app.on_key(key(KeyCode::BackTab));
+        assert_eq!(app.new_session_harness(), Harness::Pi);
+        app.on_key(key(KeyCode::Enter)); // «Nueva sesión» con Pi
+        let (items, _, _) = &launched(&app)[0];
+        assert_eq!(items[0].harness, Harness::Pi);
+        // Los harness que no son Claude arrancan con la ruta como la da el sistema.
+        assert_eq!(items[0].cwd, paths::natural(&beta));
+        assert_eq!(items[0].tab_color.as_deref(), Some(Harness::Pi.info().color));
+        // Con otro agente que no sea Claude, el título de la pestaña lo nombra.
+        assert_eq!(items[0].title, "beta · pi · nueva");
+    }
+
+    #[test]
+    fn new_session_agent_falls_back_to_an_installed_one() {
+        let (mut app, _a, _b) = fixture("agent-fallback");
+        app.new_harness = Harness::Codex;
+        assert_eq!(app.new_session_harness(), Harness::Claude);
+        // Con un solo agente no hay nada que cambiar.
+        app.on_key(key(KeyCode::Enter));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.new_session_harness(), Harness::Claude);
+        // Sin ninguno instalado se respeta el elegido: el fallo dirá cuál falta.
+        app.env = Ok(test_env(&[]));
+        assert_eq!(app.new_session_harness(), Harness::Codex);
+        // Un color general propio manda sobre el de cada harness.
+        assert_eq!(app.tab_color(Harness::Codex), Harness::Codex.info().color);
+        app.cfg.general.tab_color = "#123456".into();
+        assert_eq!(app.tab_color(Harness::Codex), "#123456");
+    }
+
+    #[test]
+    fn options_modal_follows_the_chosen_agent() {
+        let (mut app, _a, _b) = fixture_with("agent-field", &Harness::ALL, &[]);
+        app.on_key(key(KeyCode::Enter)); // entra a beta
+        app.on_key(ch('o')); // opciones de «Nueva sesión»
+        assert_eq!(options(&app).harness, Harness::Claude);
+        assert_fields_match(options(&app), Harness::Claude, false);
+        let agent = options(&app).fields.iter().position(|f| f.id == FieldId::Harness).expect("campo Agente");
+        for _ in 0..agent {
+            app.on_key(key(KeyCode::Down));
+        }
+        for expected in [Harness::Codex, Harness::Opencode, Harness::Antigravity, Harness::Pi, Harness::Claude] {
+            app.on_key(key(KeyCode::Right));
+            let m = options(&app);
+            assert_eq!(m.harness, expected);
+            assert_eq!(m.fields[m.focus].id, FieldId::Harness, "el foco sigue en Agente");
+            assert_fields_match(m, expected, false);
+            // Destino y agente siguen ahí; ningún campo se repite.
+            let mut ids: Vec<FieldId> = m.fields.iter().map(|f| f.id).collect();
+            assert!(ids.contains(&FieldId::Target));
+            let n = ids.len();
+            ids.dedup();
+            assert_eq!(ids.len(), n);
+        }
+        app.on_key(key(KeyCode::Left)); // de Claude vuelve a Pi
+        app.on_key(key(KeyCode::Enter));
+        let (items, _, _) = &launched(&app)[0];
+        assert_eq!(items[0].harness, Harness::Pi);
+        // El título sigue al agente elegido en el modal, no al que había al abrirlo.
+        assert_eq!(items[0].title, "beta · pi · nueva");
+    }
+
+    #[test]
+    fn entry_titles_and_colors_follow_the_agent() {
+        let (mut app, _alpha, beta) = mixed("entry-agent");
+        let entry = |session: SessionRef, harness: Harness| SetEntry {
+            repo: beta.to_string_lossy().into_owned(),
+            cwd: None,
+            session,
+            harness,
+            title: None,
+            tab_color: None,
+            options: LaunchOptions::default(),
+        };
+        // Mismo repo, dos agentes: títulos distintos.
+        assert_eq!(entry_label(&entry(SessionRef::Latest, Harness::Claude), &app.catalog), "beta · última");
+        assert_eq!(entry_label(&entry(SessionRef::Latest, Harness::Codex), &app.catalog), "beta · codex · última");
+        assert_eq!(entry_label(&entry(SessionRef::New, Harness::Opencode), &app.catalog), "beta · opencode · nueva");
+        // Una sesión concreta manda sobre el harness de la entrada: color y agente son los suyos.
+        let stale = entry(SessionRef::Id("x1".into()), Harness::Claude);
+        assert_eq!(app.entry_harness(&stale), Harness::Codex);
+        assert_eq!(app.entry_color(&stale), Harness::Codex.info().color);
+        assert_eq!(app.entry_color(&entry(SessionRef::New, Harness::Pi)), Harness::Pi.info().color);
+        // El color propio de la entrada, o uno general elegido por el usuario, mandan.
+        let own = SetEntry { tab_color: Some("#000001".into()), ..entry(SessionRef::New, Harness::Pi) };
+        assert_eq!(app.entry_color(&own), "#000001");
+        app.cfg.general.tab_color = "#123456".into();
+        assert_eq!(app.entry_color(&entry(SessionRef::New, Harness::Pi)), "#123456");
+    }
+
+    #[test]
+    fn entry_modal_placeholder_follows_the_agent() {
+        let (mut app, _a, _b) = mixed("entry-placeholder");
+        app.on_key(ch('n'));
+        app.on_key(key(KeyCode::Down));
+        app.on_key(ch('a'));
+        app.on_key(key(KeyCode::Enter)); // beta
+        app.on_key(key(KeyCode::Enter)); // «Nueva sesión» → modal de la entrada
+        let placeholder = |app: &App| match &options(app).field(FieldId::Title).unwrap().kind {
+            FieldKind::Text { placeholder, .. } => placeholder.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(placeholder(&app), "beta · nueva");
+        let agent = options(&app).fields.iter().position(|f| f.id == FieldId::Harness).unwrap();
+        for _ in 0..agent {
+            app.on_key(key(KeyCode::Down));
+        }
+        app.on_key(key(KeyCode::Right)); // Codex
+        assert_eq!(placeholder(&app), "beta · codex · nueva");
+    }
+
+    #[test]
+    fn existing_session_keeps_its_agent() {
+        let (mut app, alpha, _beta) = mixed("agent-existing");
+        // Recientes: x1 (Codex) es la más reciente.
+        app.on_key(ch('2'));
+        app.on_key(ch('o'));
+        let m = options(&app);
+        assert_eq!(m.harness, Harness::Codex);
+        assert!(m.field(FieldId::Harness).is_none(), "una sesión existente no cambia de agente");
+        assert_fields_match(m, Harness::Codex, true);
+        app.on_key(key(KeyCode::Esc));
+
+        // Abrir la de Pi: su harness, su carpeta y su archivo de sesión.
+        let i = app.catalog.by_id["p1"];
+        let file = app.catalog.sessions[i].meta.file.to_string_lossy().into_owned();
+        app.launch_session(i);
+        let (items, _, _) = &launched(&app)[0];
+        assert_eq!(items[0].harness, Harness::Pi);
+        assert_eq!(items[0].cwd, paths::natural(&alpha));
+        assert!(items[0].args.contains(&file), "{:?}", items[0].args);
+        assert_eq!(items[0].session_id.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn sets_remember_the_agent() {
+        let (mut app, _alpha, beta) = mixed("set-agent");
+        app.on_key(ch('n'));
+        app.on_key(key(KeyCode::Down)); // sale del nombre
+        app.on_key(ch('a')); // elegir repo
+        app.on_key(key(KeyCode::Enter)); // beta (el más reciente)
+        app.on_key(key(KeyCode::Tab)); // agente: Codex
+        app.on_key(key(KeyCode::Down)); // «Última sesión»
+        app.on_key(key(KeyCode::Enter));
+        assert_eq!(options(&app).harness, Harness::Codex);
+        assert!(options(&app).field(FieldId::Harness).is_some());
+        app.on_key(key(KeyCode::Enter)); // guardar
+        let entry = &app.cfg.sets[0].entries[0];
+        assert_eq!((entry.harness, &entry.session), (Harness::Codex, &SessionRef::Latest));
+        // El color por defecto del harness no se guarda en la entrada.
+        assert_eq!(entry.tab_color, None);
+
+        // «Última» es la última de ese agente en la carpeta: x1, no la s3 de Claude.
+        app.launch_set(0);
+        let (items, _, _) = &launched(&app)[0];
+        assert_eq!(items[0].harness, Harness::Codex);
+        assert_eq!(items[0].session_id.as_deref(), Some("x1"));
+        assert_eq!(items[0].cwd, paths::natural(&beta));
+        assert_eq!(items[0].tab_color.as_deref(), Some(Harness::Codex.info().color));
+
+        // Sin sesiones de ese agente en la carpeta, abre una nueva con él.
+        app.cfg.sets[0].entries[0].harness = Harness::Antigravity;
+        app.launch_set(0);
+        let (items, _, _) = &launched(&app)[1];
+        assert_eq!(items[0].harness, Harness::Antigravity);
+        let (new_args, _) = Harness::Antigravity.args(&Mode::New, &LaunchOptions::default(), None);
+        assert_eq!(items[0].args, new_args);
+
+        // Una sesión concreta manda sobre el harness que diga la entrada.
+        app.cfg.sets[0].entries[0].session = SessionRef::Id("s3".into());
+        app.launch_set(0);
+        let (items, _, _) = &launched(&app)[2];
+        assert_eq!(items[0].harness, Harness::Claude);
+        assert_eq!(items[0].args, vec!["-r", "s3"]);
+    }
+
+    #[test]
+    fn guard_without_fork_only_offers_to_open_anyway() {
+        // Un harness que no sabe bifurcar desde la línea de comandos.
+        let Some(h) = Harness::ALL.into_iter().find(|h| !h.info().fork) else { return };
+        let (mut app, _a, _b) = fixture_with("guard-no-fork", &Harness::ALL, &[("n1", h, true, 200_000, "Sin fork")]);
+        let mut live = HashMap::new();
+        live.insert("n1".to_string(), LiveSession { harness: h, pid: 7, session_id: "n1".into(), entrypoint: "cli".into(), ..Default::default() });
+        app.live = Arc::new(live);
+        app.on_key(ch('2')); // Recientes: n1 es la más reciente
+        app.on_key(key(KeyCode::Enter));
+        let Some(Modal::Guard(g)) = &app.modal else { panic!("se esperaba la guarda") };
+        assert!(!g.can_fork);
+        assert_eq!(g.choices(), [GuardChoice::OpenAnyway, GuardChoice::Cancel]);
+        assert!(!g.conflicts[0].detail.contains("inactiva"), "solo se sabe que está abierta: {}", g.conflicts[0].detail);
+        app.on_key(ch('f')); // sin fork, la tecla no hace nada
+        assert!(matches!(app.modal, Some(Modal::Guard(_))));
+        assert!(launched(&app).is_empty());
+        app.on_key(key(KeyCode::Enter)); // primera opción: abrir igual
+        let (items, _, _) = &launched(&app)[0];
+        assert_eq!(items[0].harness, h);
+        assert_eq!(items[0].session_id.as_deref(), Some("n1"));
+    }
+
+    #[test]
+    fn filter_finds_sessions_by_agent() {
+        let (app, _a, _b) = mixed("filter-agent");
+        let ids = |f: &str| -> Vec<String> { app.recent_rows(f).into_iter().map(|i| app.catalog.sessions[i].meta.id.clone()).collect() };
+        assert_eq!(ids("codex"), ["x1"]);
+        assert_eq!(ids("claude").len(), 3);
+        assert_eq!(ids("pi alfa"), ["p1"]);
+        // Con un solo harness la palabra no filtra nada (no está en ningún título).
+        let (solo, _a, _b) = fixture("filter-agent-solo");
+        assert!(solo.recent_rows("claude").is_empty());
     }
 }

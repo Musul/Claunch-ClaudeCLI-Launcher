@@ -34,9 +34,13 @@ pub fn config_dir() -> PathBuf {
 }
 
 /// Índice, log y archivos de arranque: `%LOCALAPPDATA%\claunch` (Windows) o
-/// `~/.local/share/claunch` (Linux, `XDG_DATA_HOME`).
+/// `~/.local/share/claunch` (Linux, `XDG_DATA_HOME`). `CLAUNCH_DATA_DIR`
+/// permite otra carpeta (pruebas, como `CLAUNCH_CONFIG`).
 pub fn data_dir() -> PathBuf {
-    dirs::data_local_dir().unwrap_or_else(home).join("claunch")
+    match std::env::var_os("CLAUNCH_DATA_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => dirs::data_local_dir().unwrap_or_else(home).join("claunch"),
+    }
 }
 
 pub fn launch_dir() -> PathBuf {
@@ -92,6 +96,21 @@ pub fn normalize(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// La ruta como la da Windows: igual que [`normalize`] pero con la unidad en
+/// mayúscula (`C:\Users\x`). Es la grafía con la que arrancan los harness que
+/// no son Claude. En Linux equivale a `normalize`.
+pub fn natural(path: &Path) -> PathBuf {
+    let p = normalize(path);
+    if cfg!(windows) {
+        let s = p.to_string_lossy();
+        let b = s.as_bytes();
+        if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_lowercase() {
+            return PathBuf::from(format!("{}{}", (b[0] as char).to_ascii_uppercase(), &s[1..]));
+        }
+    }
+    p
+}
+
 /// Clave para comparar rutas como lo hace el sistema de archivos: sin
 /// distinguir mayúsculas en Windows, distinguiéndolas en Linux.
 pub fn key(path: &Path) -> String {
@@ -136,37 +155,27 @@ pub fn display(path: &Path) -> String {
     ps.into_owned()
 }
 
-/// Busca un ejecutable en el PATH (prueba .exe, .cmd y .bat).
-#[cfg(windows)]
+/// Busca un ejecutable en el PATH. Las entradas vacías o relativas no
+/// cuentan: la ruta que salga se usa después desde otra carpeta.
 pub fn which(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    let has_ext = Path::new(name).extension().is_some();
-    for dir in std::env::split_paths(&path) {
-        if has_ext {
-            let c = dir.join(name);
-            if c.is_file() {
-                return Some(c);
-            }
-            continue;
-        }
-        for ext in ["exe", "cmd", "bat"] {
-            let c = dir.join(format!("{name}.{ext}"));
-            if c.is_file() {
-                return Some(c);
-            }
-        }
-    }
-    None
+    std::env::split_paths(&path).filter(|dir| dir.is_absolute()).find_map(|dir| which_in(&dir, name))
 }
 
-/// Busca un ejecutable en el PATH (archivo con permiso de ejecución).
+/// El ejecutable `name` de una carpeta, si está (prueba .exe, .cmd y .bat).
+#[cfg(windows)]
+pub fn which_in(dir: &Path, name: &str) -> Option<PathBuf> {
+    if Path::new(name).extension().is_some() {
+        return Some(dir.join(name)).filter(|c| c.is_file());
+    }
+    ["exe", "cmd", "bat"].into_iter().map(|ext| dir.join(format!("{name}.{ext}"))).find(|c| c.is_file())
+}
+
+/// El ejecutable `name` de una carpeta, si está (archivo con permiso de ejecución).
 #[cfg(not(windows))]
-pub fn which(name: &str) -> Option<PathBuf> {
+pub fn which_in(dir: &Path, name: &str) -> Option<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|c| std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+    Some(dir.join(name)).filter(|c| std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
 }
 
 /// Ubicación de Git Bash (`bin\bash.exe`, que prepara el entorno MSYS).
@@ -216,6 +225,25 @@ mod tests {
         assert_eq!(normalize(Path::new(r"\\?\C:\a")), PathBuf::from(r"c:\a"));
         assert_eq!(normalize(Path::new("/c/Users/X")), PathBuf::from(r"c:\Users\X"));
         assert_eq!(normalize(Path::new(r"C:\")), PathBuf::from(r"c:\"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn natural_uppercases_drive() {
+        assert_eq!(natural(Path::new(r"c:\Users\X\repo\")), PathBuf::from(r"C:\Users\X\repo"));
+        assert_eq!(natural(Path::new("c:/Users/X")), PathBuf::from(r"C:\Users\X"));
+        assert_eq!(natural(Path::new("C:/Users/X/")), PathBuf::from(r"C:\Users\X"));
+        assert_eq!(natural(Path::new(r"c:\")), PathBuf::from(r"C:\"));
+        assert_eq!(natural(Path::new(r"\\servidor\recurso")), PathBuf::from(r"\\servidor\recurso"));
+        // Misma carpeta para el sistema de archivos, se escriba como se escriba.
+        assert_eq!(key(&natural(Path::new(r"c:\r\app"))), key(Path::new("C:/r/app/")));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn natural_keeps_unix_paths() {
+        assert_eq!(natural(Path::new("/home/ana/Repo/")), PathBuf::from("/home/ana/Repo"));
+        assert_eq!(natural(Path::new("/")), PathBuf::from("/"));
     }
 
     #[cfg(windows)]

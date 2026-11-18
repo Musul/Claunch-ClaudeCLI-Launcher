@@ -1,24 +1,28 @@
 //! Arranque de sesiones en pestañas, paneles o ventanas.
 //!
 //! Windows. Cadena por pestaña: `wt.exe` → shell (Git Bash por defecto) →
-//! `claunch run <spec>` → `claude`. El paso intermedio fija el `cwd` con la
-//! unidad en minúscula (MSYS siempre la pasa en mayúscula y `/resume` dejaría
-//! de ver las sesiones de VS Code) y recibe los argumentos por un JSON UTF-8,
-//! sin las capas de escape de wt, bash y cmd.
+//! `claunch run <spec>` → el harness (`claude`, `codex`, `opencode`, `agy`,
+//! `pi`). El paso intermedio fija el `cwd` con la grafía que espera el harness
+//! (Claude, con la unidad en minúscula: MSYS siempre la pasa en mayúscula y
+//! `/resume` dejaría de ver las sesiones de VS Code) y recibe los argumentos
+//! por un JSON UTF-8, sin las capas de escape de wt, bash y cmd.
 //!
 //! Linux. tmux o un emulador gráfico (ver `terminal`) → `/bin/sh <script>` →
-//! `claunch run <spec>` → `claude`.
+//! `claunch run <spec>` → el harness.
 //!
 //! Al arrancar, `claunch run` deja una marca `<token>.started` que la TUI usa
-//! para confirmar el arranque.
+//! para confirmar el arranque y, para los harness que no publican sus procesos,
+//! un aviso de sesión abierta (ver `data::live`).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
 use anyhow::{Context, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{General, LaunchOptions, SetLayout, SetWindow, Shell};
+use crate::config::{Config, General, SetLayout, SetWindow, Shell};
+use crate::harness::Harness;
 use crate::paths;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +35,9 @@ pub enum Mode {
 #[derive(Debug, Clone)]
 pub struct LaunchItem {
     pub cwd: PathBuf,
-    pub claude_args: Vec<String>,
+    pub harness: Harness,
+    /// Argumentos del harness, sin el ejecutable (ver `Harness::args`).
+    pub args: Vec<String>,
     pub title: String,
     /// Texto corto para el banner y los avisos (nombre del repo).
     pub label: String,
@@ -39,8 +45,9 @@ pub struct LaunchItem {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub shell: Shell,
     pub tab_color: Option<String>,
-    /// Mantener el título fijo aunque Claude lo cambie.
+    /// Mantener el título fijo aunque el harness lo cambie.
     pub fixed_title: bool,
+    /// Id de la sesión, si se conoce antes de arrancar.
     pub session_id: Option<String>,
 }
 
@@ -52,45 +59,13 @@ pub enum Placement {
     Set(SetLayout, SetWindow),
 }
 
-/// Argumentos de `claude` para un modo y opciones. Devuelve también el id de
-/// sesión si se conoce de antemano (las nuevas reciben `--session-id`).
-pub fn claude_args(mode: &Mode, opts: &LaunchOptions) -> (Vec<String>, Option<String>) {
-    let mut a = Vec::new();
-    let id = match mode {
-        Mode::New => {
-            let id = uuid::Uuid::new_v4().to_string();
-            a.extend(["--session-id".to_string(), id.clone()]);
-            if let Some(n) = opts.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-                a.extend(["-n".to_string(), n.to_string()]);
-            }
-            if let Some(w) = opts.worktree.as_deref().map(str::trim).filter(|w| !w.is_empty()) {
-                a.extend(["-w".to_string(), w.to_string()]);
-            }
-            Some(id)
-        }
-        Mode::Resume(id) => {
-            a.extend(["-r".to_string(), id.clone()]);
-            Some(id.clone())
-        }
-        Mode::Fork(id) => {
-            a.extend(["-r".to_string(), id.clone(), "--fork-session".to_string()]);
-            None
-        }
-    };
-    if let Some(m) = opts.model.as_deref().filter(|m| !m.is_empty()) {
-        a.extend(["--model".to_string(), m.to_string()]);
-    }
-    if let Some(p) = opts.permission_mode.as_deref().filter(|p| !p.is_empty()) {
-        a.extend(["--permission-mode".to_string(), p.to_string()]);
-    }
-    (a, id)
-}
-
-/// Lo que `claunch run` necesita para arrancar Claude.
+/// Lo que `claunch run` necesita para arrancar el harness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunSpec {
     pub token: String,
     pub cwd: PathBuf,
+    #[serde(default)]
+    pub harness: Harness,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub title: String,
@@ -119,7 +94,12 @@ pub enum Terminal {
 /// Ejecutables resueltos una vez por arranque.
 #[derive(Debug, Clone)]
 pub struct Env {
-    pub claude: Vec<String>,
+    /// Comando (ejecutable y argumentos previos) de cada harness disponible:
+    /// activo en la config y con ejecutable localizado.
+    pub commands: BTreeMap<Harness, Vec<String>>,
+    /// Harness cuyo comando está mal configurado (config o variable de entorno
+    /// ilegible), con el motivo. Los demás siguen funcionando.
+    pub problems: BTreeMap<Harness, String>,
     /// Git Bash (Windows).
     #[cfg_attr(not(windows), allow(dead_code))]
     pub git_bash: Option<PathBuf>,
@@ -128,23 +108,65 @@ pub struct Env {
     pub general: General,
 }
 
+/// Comando de un harness: el de la config, el de `CLAUNCH_<ID>_COMMAND` (un
+/// array JSON, para pruebas) o el ejecutable que encuentre `Harness::locate`.
+/// `None` si no está instalado.
+fn harness_command(cfg: &Config, h: Harness) -> anyhow::Result<Option<Vec<String>>> {
+    let configured = cfg.harness_command(h);
+    let var = format!("CLAUNCH_{}_COMMAND", h.id().to_ascii_uppercase());
+    let cmd = if !configured.is_empty() {
+        configured
+    } else if let Ok(json) = std::env::var(&var) {
+        let cmd: Vec<String> = serde_json::from_str(&json).with_context(|| format!("{var} debe ser un array JSON"))?;
+        anyhow::ensure!(!cmd.is_empty(), "{var} no puede ser un array vacío");
+        cmd
+    } else {
+        return Ok(h.locate().map(|p| vec![p.to_string_lossy().into_owned()]));
+    };
+    Ok(Some(resolve_program(cmd, paths::which)))
+}
+
+/// Un ejecutable escrito sin ruta (`codex`, `npx`) se busca en el PATH: en
+/// Windows los que instala npm son `.cmd`, y `Command` solo encuentra por
+/// nombre los `.exe`. Si no aparece, se deja como está.
+fn resolve_program(mut cmd: Vec<String>, which: impl Fn(&str) -> Option<PathBuf>) -> Vec<String> {
+    if let Some(program) = cmd.first_mut()
+        && !program.contains(['/', '\\'])
+        && let Some(found) = which(program)
+    {
+        *program = found.to_string_lossy().into_owned();
+    }
+    cmd
+}
+
 impl Env {
-    pub fn resolve(general: &General) -> anyhow::Result<Env> {
-        let claude = if !general.claude_command.is_empty() {
-            general.claude_command.clone()
-        } else if let Ok(json) = std::env::var("CLAUNCH_CLAUDE_COMMAND") {
-            serde_json::from_str(&json).context("CLAUNCH_CLAUDE_COMMAND debe ser un array JSON")?
-        } else {
-            let p = paths::which("claude").context("no encuentro `claude` en el PATH")?;
-            vec![p.to_string_lossy().into_owned()]
-        };
+    pub fn resolve(cfg: &Config) -> anyhow::Result<Env> {
+        let general = &cfg.general;
+        let mut commands = BTreeMap::new();
+        let mut problems = BTreeMap::new();
+        for h in Harness::ALL {
+            if !cfg.harness_enabled(h) {
+                continue;
+            }
+            // Un harness mal configurado no deja sin lanzar a los demás.
+            match harness_command(cfg, h) {
+                Ok(Some(cmd)) => {
+                    commands.insert(h, cmd);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    problems.insert(h, format!("{e:#}"));
+                }
+            }
+        }
         #[cfg(windows)]
         let (git_bash, terminal) =
             (paths::find_git_bash(Some(&general.git_bash)), paths::find_wt().map_or(Terminal::Console, Terminal::Wt));
         #[cfg(not(windows))]
         let (git_bash, terminal) = (None, crate::terminal::detect(&general.terminal));
         Ok(Env {
-            claude,
+            commands,
+            problems,
             git_bash,
             terminal,
             self_exe: std::env::current_exe().context("no se pudo ubicar el ejecutable de claunch")?,
@@ -152,16 +174,38 @@ impl Env {
         })
     }
 
-    fn spec_for(&self, item: &LaunchItem) -> RunSpec {
-        RunSpec {
+    /// Harness que se pueden lanzar, en su orden habitual.
+    pub fn installed(&self) -> Vec<Harness> {
+        self.commands.keys().copied().collect()
+    }
+
+    /// Comando del harness, o por qué no se puede lanzar.
+    pub fn command(&self, h: Harness) -> anyhow::Result<&[String]> {
+        let i = h.info();
+        if let Some(problem) = self.problems.get(&h) {
+            bail!("{} mal configurado: {problem}", i.label);
+        }
+        self.commands.get(&h).map(Vec::as_slice).with_context(|| {
+            format!(
+                "no encuentro `{}` ({}). Instálalo ({}) o indica su ruta en [harness.{}] command",
+                i.program, i.label, i.install, i.id
+            )
+        })
+    }
+
+    fn spec_for(&self, item: &LaunchItem) -> anyhow::Result<RunSpec> {
+        let cmd = self.command(item.harness)?;
+        Ok(RunSpec {
             token: uuid::Uuid::new_v4().simple().to_string(),
-            cwd: paths::normalize(&item.cwd),
-            program: PathBuf::from(&self.claude[0]),
-            args: self.claude[1..].iter().cloned().chain(item.claude_args.iter().cloned()).collect(),
+            // Claude compara el `cwd` como texto: siempre con la unidad en minúscula.
+            cwd: if item.harness == Harness::Claude { paths::normalize(&item.cwd) } else { item.cwd.clone() },
+            harness: item.harness,
+            program: PathBuf::from(&cmd[0]),
+            args: cmd[1..].iter().cloned().chain(item.args.iter().cloned()).collect(),
             title: item.title.clone(),
             label: item.label.clone(),
             session_id: item.session_id.clone(),
-        }
+        })
     }
 
     /// Línea de comandos de la shell que ejecuta `claunch run <spec>`.
@@ -212,8 +256,8 @@ impl Env {
         let script = spec_path.with_extension("sh");
         let mut body = String::from("# claunch: arranque generado, se borra solo.\n");
         // Ctrl+C llega también a esta shell: sin trap, dash termina al salir
-        // Claude y se pierden el aviso para retomar y la shell. El trap no lo
-        // heredan los hijos (vuelve al valor por defecto en exec).
+        // el harness y se pierden el aviso para retomar y la shell. El trap no
+        // lo heredan los hijos (vuelve al valor por defecto en exec).
         body += "trap : INT\n";
         body += &format!("cd {} 2>/dev/null\n", q(&item.cwd.to_string_lossy()));
         body += &format!("{} run {}\n", q(&self.self_exe.to_string_lossy()), q(&spec_path.to_string_lossy()));
@@ -236,15 +280,19 @@ impl Env {
                  Ábrela en «Esta terminal» (tecla o → Destino), entra en tmux o configura general.terminal"
             );
         }
-        let dir = paths::launch_dir();
-        std::fs::create_dir_all(&dir)?;
-        let mut prepared = Vec::with_capacity(items.len());
-        let mut tokens = Vec::with_capacity(items.len());
+        // Todo se comprueba antes de escribir nada: un set no se abre a medias.
+        let mut specs = Vec::with_capacity(items.len());
         for item in items {
             if !item.cwd.is_dir() {
                 bail!("la carpeta {} no existe", item.cwd.display());
             }
-            let spec = self.spec_for(item);
+            specs.push(self.spec_for(item)?);
+        }
+        let dir = paths::launch_dir();
+        std::fs::create_dir_all(&dir)?;
+        let mut prepared = Vec::with_capacity(items.len());
+        let mut tokens = Vec::with_capacity(items.len());
+        for (item, spec) in items.iter().zip(specs) {
             let spec_path = dir.join(format!("{}.json", spec.token));
             crate::util::write_atomic(&spec_path, &serde_json::to_vec_pretty(&spec)?)?;
             let cmd = self.shell_cmdline(item, &spec_path)?;
@@ -276,8 +324,11 @@ impl Env {
 
     /// Arranca en la terminal actual y espera (la TUI se suspende antes).
     pub fn run_here(&self, item: &LaunchItem) -> anyhow::Result<i32> {
-        let spec = self.spec_for(item);
-        run_spec(&spec, false)
+        if !item.cwd.is_dir() {
+            bail!("la carpeta {} no existe", item.cwd.display());
+        }
+        let spec = self.spec_for(item)?;
+        run_spec(&spec, false, &crate::data::live::markers_dir())
     }
 }
 
@@ -416,7 +467,7 @@ pub fn wt_invocations(items: &[(&LaunchItem, Vec<String>)], placement: Placement
 
 // ---------------------------------------------------------------- claunch run
 
-/// Ignora Ctrl+C en claunch mientras Claude corre (Claude lo gestiona).
+/// Ignora Ctrl+C en claunch mientras el harness corre (él lo gestiona).
 /// Un handler propio, a diferencia de `SetConsoleCtrlHandler(NULL, TRUE)`, no
 /// lo heredan los procesos hijos.
 #[cfg(windows)]
@@ -431,10 +482,10 @@ fn ignore_ctrl_c() {
     }
 }
 
-/// Ignora SIGINT en claunch mientras Claude corre: Ctrl+C también llega a
+/// Ignora SIGINT en claunch mientras el harness corre: Ctrl+C también llega a
 /// claunch (mismo grupo de procesos) y, si lo matara, la shell retomaría la
-/// terminal con Claude aún vivo. Un handler propio, a diferencia de `SIG_IGN`,
-/// vuelve al valor por defecto en `exec`: Claude no lo hereda.
+/// terminal con el harness aún vivo. Un handler propio, a diferencia de
+/// `SIG_IGN`, vuelve al valor por defecto en `exec`: el harness no lo hereda.
 #[cfg(unix)]
 fn ignore_ctrl_c() {
     extern "C" fn handler(_sig: libc::c_int) {}
@@ -456,20 +507,43 @@ const DIM: &str = "\x1b[2m";
 const BOLD: &str = "\x1b[1m";
 const RESET: &str = "\x1b[0m";
 
-fn run_spec(spec: &RunSpec, set_title: bool) -> anyhow::Result<i32> {
+/// Arranca el harness y espera. `markers` es la carpeta donde se avisa de que
+/// la sesión está abierta (la de la TUI que la lanzó).
+fn run_spec(spec: &RunSpec, set_title: bool, markers: &Path) -> anyhow::Result<i32> {
     if set_title {
         print!("\x1b]0;{}\x07", spec.title.replace(['\x07', '\x1b'], ""));
     }
-    println!("{ACCENT}✳{RESET} {DIM}claunch ·{RESET} {BOLD}{}{RESET} {DIM}· {}{RESET}", spec.label, spec.title);
+    let agent = if spec.harness == Harness::Claude { String::new() } else { format!(" {DIM}· {}{RESET}", spec.harness.label()) };
+    println!("{ACCENT}✳{RESET} {DIM}claunch ·{RESET} {BOLD}{}{RESET} {DIM}· {}{RESET}{agent}", spec.label, spec.title);
+    // Lo que este ejecutable no admite se quita antes de arrancar (la consulta
+    // puede tardar unos segundos: Ctrl+C aún corta). El aviso se repite al
+    // salir, por si el harness limpia la pantalla.
+    let mut args = spec.args.clone();
+    let note = spec.harness.preflight(&spec.program, &mut args).map(|n| format!("{ACCENT}claunch:{RESET} {n}"));
+    if let Some(n) = &note {
+        println!("{n}");
+    }
     ignore_ctrl_c();
-    let status = Command::new(&spec.program)
-        .args(&spec.args)
+    // Hora anterior al proceso: ninguna sesión suya puede nacer antes.
+    let started_ms = crate::util::now_ms();
+    let mut child = Command::new(&spec.program)
+        .args(&args)
         .current_dir(&spec.cwd)
-        .status()
+        .spawn()
         .with_context(|| format!("no se pudo ejecutar {}", spec.program.display()))?;
-    let code = status.code().unwrap_or(1);
+    // Claude publica sus procesos; para el resto, claunch avisa de que la
+    // sesión está abierta mientras dure el proceso.
+    let marker = (spec.harness != Harness::Claude).then(|| crate::data::live::publish(markers, spec, child.id(), started_ms)).flatten();
+    let status = child.wait();
+    if let Some(m) = marker {
+        let _ = std::fs::remove_file(m);
+    }
+    let code = status.with_context(|| format!("se perdió el proceso de {}", spec.program.display()))?.code().unwrap_or(1);
+    if let Some(n) = &note {
+        println!("\n{n}");
+    }
     match &spec.session_id {
-        Some(id) => println!("\n{DIM}↩ Para retomar: claude -r {id}   ·   claunch para elegir otra{RESET}"),
+        Some(id) => println!("\n{DIM}↩ Para retomar: {}   ·   claunch para elegir otra{RESET}", spec.harness.resume_command(id)),
         None => println!("\n{DIM}↩ claunch para elegir otra sesión{RESET}"),
     }
     Ok(code)
@@ -496,7 +570,10 @@ pub fn run_main(args: &[String]) -> ExitCode {
     if let Err(e) = std::fs::write(&marker, std::process::id().to_string()) {
         crate::warn_log!("run: no se pudo escribir la marca {}: {e}", marker.display());
     }
-    match run_spec(&spec, true) {
+    // El aviso de sesión abierta va junto al spec, en la carpeta de datos de la
+    // TUI que lanzó: esta pestaña puede no heredar su `CLAUNCH_DATA_DIR`.
+    let markers = markers_dir_for(&spec_path);
+    match run_spec(&spec, true, &markers) {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("{ACCENT}claunch:{RESET} {e:#}");
@@ -504,6 +581,14 @@ pub fn run_main(args: &[String]) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+/// Carpeta de avisos de la TUI que escribió el spec: `<datos>/launch/<token>.json`
+/// → `<datos>/live`. Un spec suelto (de una prueba a mano, o con ruta
+/// relativa) no dice de qué carpeta de datos es: la de este proceso.
+fn markers_dir_for(spec_path: &Path) -> PathBuf {
+    let launch = spec_path.parent().filter(|dir| dir.is_absolute() && dir.file_name().is_some_and(|n| n == "launch"));
+    launch.and_then(Path::parent).map(|data| data.join("live")).unwrap_or_else(crate::data::live::markers_dir)
 }
 
 /// Borra restos de arranques viejos (más de un día).
@@ -525,7 +610,8 @@ mod tests {
     fn item(title: &str) -> LaunchItem {
         LaunchItem {
             cwd: PathBuf::from(r"c:\r\app"),
-            claude_args: vec![],
+            harness: Harness::Claude,
+            args: vec![],
             title: title.into(),
             label: "app".into(),
             shell: Shell::GitBash,
@@ -546,16 +632,93 @@ mod tests {
         assert_eq!(pane_grid(7).iter().sum::<usize>(), 7);
     }
 
+    fn env(commands: &[(Harness, &[&str])]) -> Env {
+        Env {
+            commands: commands.iter().map(|(h, c)| (*h, c.iter().map(|s| s.to_string()).collect())).collect(),
+            problems: BTreeMap::new(),
+            git_bash: None,
+            terminal: Terminal::Unavailable,
+            self_exe: PathBuf::from("claunch"),
+            general: General::default(),
+        }
+    }
+
     #[test]
-    fn args_for_modes() {
-        let opts = LaunchOptions { model: Some("opus".into()), name: Some("x".into()), ..Default::default() };
-        let (a, id) = claude_args(&Mode::New, &opts);
-        assert_eq!(a[0], "--session-id");
-        assert_eq!(id.as_deref(), Some(a[1].as_str()));
-        assert!(a.windows(2).any(|w| w == ["-n", "x"]));
-        let (a, id) = claude_args(&Mode::Fork("abc".into()), &LaunchOptions::default());
-        assert_eq!(a, vec!["-r", "abc", "--fork-session"]);
-        assert_eq!(id, None);
+    fn spec_uses_the_command_of_each_harness() {
+        let e = env(&[(Harness::Claude, &["claude"]), (Harness::Codex, &["npx", "codex"])]);
+        assert_eq!(e.installed(), [Harness::Claude, Harness::Codex]);
+
+        let mut it = item("x");
+        it.harness = Harness::Codex;
+        it.cwd = PathBuf::from(r"C:\r\App");
+        it.args = vec!["resume".into(), "abc".into()];
+        let spec = e.spec_for(&it).unwrap();
+        assert_eq!(spec.program, PathBuf::from("npx"));
+        assert_eq!(spec.args, ["codex", "resume", "abc"]);
+        // Solo Claude recibe el `cwd` normalizado; el resto, tal cual.
+        assert_eq!(spec.cwd, PathBuf::from(r"C:\r\App"));
+        assert_eq!(spec.harness, Harness::Codex);
+
+        it.harness = Harness::Pi;
+        let err = e.spec_for(&it).unwrap_err().to_string();
+        assert!(err.contains("`pi`") && err.contains("[harness.pi]"), "{err}");
+        // Sin dónde abrir, el fallo avisa antes de escribir nada.
+        assert!(e.launch(&[it], Placement::NewTab).is_err());
+    }
+
+    #[test]
+    fn bare_program_names_are_resolved_in_the_path() {
+        // `codex` instalado con npm en Windows es `codex.cmd`: hay que dar la ruta completa.
+        let which = |name: &str| (name == "codex").then(|| PathBuf::from("/npm/codex.cmd"));
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(resolve_program(s(&["codex", "-m", "x"]), which), s(&["/npm/codex.cmd", "-m", "x"]));
+        // Con ruta o sin encontrar, se respeta lo escrito.
+        assert_eq!(resolve_program(s(&["./bin/codex"]), which), s(&["./bin/codex"]));
+        assert_eq!(resolve_program(s(&[r"C:\bin\codex.exe"]), which), s(&[r"C:\bin\codex.exe"]));
+        assert_eq!(resolve_program(s(&["otro"]), which), s(&["otro"]));
+        assert!(resolve_program(Vec::new(), which).is_empty());
+    }
+
+    #[test]
+    fn markers_go_next_to_the_spec() {
+        let data = std::env::temp_dir().join("claunch-tests").join("datos-tui");
+        assert_eq!(markers_dir_for(&data.join("launch").join("abc.json")), data.join("live"));
+        // Un spec suelto o con ruta relativa no dice de qué carpeta de datos
+        // es: la de este proceso.
+        let own = crate::data::live::markers_dir();
+        assert_eq!(markers_dir_for(Path::new("abc.json")), own);
+        assert_eq!(markers_dir_for(Path::new("launch/abc.json")), own);
+        assert_eq!(markers_dir_for(&data.join("abc.json")), own);
+        assert_eq!(markers_dir_for(&data.join("otra").join("abc.json")), own);
+    }
+
+    #[test]
+    fn a_misconfigured_harness_does_not_block_the_rest() {
+        let mut e = env(&[(Harness::Claude, &["claude"])]);
+        e.problems.insert(Harness::Pi, "CLAUNCH_PI_COMMAND debe ser un array JSON".into());
+        assert!(e.command(Harness::Claude).is_ok());
+        let err = e.command(Harness::Pi).unwrap_err().to_string();
+        assert!(err.contains("Pi mal configurado") && err.contains("array JSON"), "{err}");
+        assert_eq!(e.installed(), [Harness::Claude]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn claude_cwd_keeps_lowercase_drive() {
+        let e = env(&[(Harness::Claude, &["claude"])]);
+        let mut it = item("x");
+        it.cwd = PathBuf::from(r"C:\r\App");
+        assert_eq!(e.spec_for(&it).unwrap().cwd, PathBuf::from(r"c:\r\App"));
+    }
+
+    #[test]
+    fn run_spec_roundtrips_and_old_specs_default_to_claude() {
+        let old = r#"{"token":"t","cwd":"/r","program":"claude","args":[],"title":"a","label":"b","session_id":null}"#;
+        let spec: RunSpec = serde_json::from_str(old).unwrap();
+        assert_eq!(spec.harness, Harness::Claude);
+        let new = RunSpec { harness: Harness::Opencode, ..spec };
+        let back: RunSpec = serde_json::from_str(&serde_json::to_string(&new).unwrap()).unwrap();
+        assert_eq!(back.harness, Harness::Opencode);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 name = "claunch"
 version = "0.3.0"
 edition = "2024"
-description = "Launcher TUI para repos y sesiones de Claude Code en Windows (Windows Terminal + Git Bash) y Linux (tmux o emulador gráfico)"
+description = "Launcher TUI para repos y sesiones de agentes de código (Claude Code, Codex, opencode, Antigravity y Pi) en Windows (Windows Terminal + Git Bash) y Linux (tmux o emulador gráfico)"
 license = "MIT"
 publish = false
 
@@ -13,6 +13,7 @@ jiff = "0.2.39"
 memchr = "2.8.3"
 ratatui = "0.30"
 rayon = "1.12.0"
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.154", features = ["raw_value", "preserve_order"] }
 tachyonfx = "0.25"

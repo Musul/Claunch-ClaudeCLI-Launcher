@@ -39,11 +39,12 @@ fn leave() {
 
 pub fn scan_config(cfg: &Config) -> ScanConfig {
     ScanConfig {
-        claude_home: crate::paths::claude_home(),
+        sources: cfg.harness_sources(),
         roots: cfg.scan_roots(),
         depth: cfg.general.scan_depth,
         exclude: cfg.general.scan_exclude.clone(),
         usage: cfg.general.show_usage,
+        markers: data::live::markers_dir(),
     }
 }
 
@@ -132,7 +133,7 @@ fn event_loop(terminal: &mut Term, app: &mut App, rx: &std::sync::mpsc::Receiver
     }
 }
 
-/// Suspende la TUI, corre Claude en esta terminal y vuelve.
+/// Suspende la TUI, corre el harness en esta terminal y vuelve.
 fn run_here(terminal: &mut Term, app: &mut App, item: crate::launch::LaunchItem) -> anyhow::Result<()> {
     let env = match &app.env {
         Ok(e) => e.clone(),
@@ -263,6 +264,77 @@ pub fn open_set_headless(cfg: Config, idx: usize) -> anyhow::Result<()> {
     }
     if app.toasts.iter().any(|t| t.kind == app::ToastKind::Error) {
         anyhow::bail!("no se pudo abrir «{name}»");
+    }
+    Ok(())
+}
+
+/// `claunch agents [--json | --installed]`: qué agentes ve claunch en este
+/// equipo (si están activos, con qué ejecutable se lanzan, dónde guardan sus
+/// datos y cuántas sesiones tienen). Sirve para diagnosticar por qué falta
+/// alguno. `--installed` solo nombra los que se pueden lanzar, uno por línea
+/// y sin indexar nada: lo usan los instaladores.
+pub fn agents(args: &[String]) -> anyhow::Result<()> {
+    use crate::harness::Harness;
+    use crate::launch::Env;
+    let json = args.iter().any(|a| a == "--json");
+    let (cfg, cfg_error) = Config::load();
+    // La salida puede ir a una tubería que se cierra antes (`| head`): no es un fallo.
+    let mut out = stdout().lock();
+    if args.iter().any(|a| a == "--installed") {
+        for h in Env::resolve(&cfg)?.installed() {
+            let _ = writeln!(out, "{}", h.label());
+        }
+        return Ok(());
+    }
+    if let Some(e) = &cfg_error {
+        eprintln!("claunch: {e}");
+    }
+    let app = load_blocking(cfg.clone(), cfg_error, false)?;
+    let env = app.env.as_ref().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let rows: Vec<serde_json::Value> = Harness::ALL
+        .into_iter()
+        .map(|h| {
+            let home = cfg.harness_home(h);
+            serde_json::json!({
+                "id": h.id(),
+                "label": h.label(),
+                "enabled": cfg.harness_enabled(h),
+                "command": env.commands.get(&h),
+                "problem": env.problems.get(&h),
+                "install": h.info().install,
+                "home": home,
+                "home_exists": home.is_dir(),
+                "sessions": app.catalog.sessions.iter().filter(|s| s.meta.harness == h).count(),
+                "live": app.live.values().filter(|l| l.harness == h).count(),
+            })
+        })
+        .collect();
+    if json {
+        let _ = writeln!(out, "{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    let _ = writeln!(out, "{:<13} {:<13} {:>8}  ejecutable y datos", "agente", "estado", "sesiones");
+    for (h, r) in Harness::ALL.into_iter().zip(&rows) {
+        let enabled = r["enabled"].as_bool().unwrap_or(false);
+        let command = env.commands.get(&h).map(|c| c.join(" "));
+        let problem = env.problems.get(&h);
+        let state = match (enabled, problem, &command) {
+            (false, ..) => "desactivado",
+            (true, Some(_), _) => "mal config.",
+            (true, None, Some(_)) => "listo",
+            (true, None, None) => "sin instalar",
+        };
+        let sessions = if enabled { r["sessions"].to_string() } else { "-".into() };
+        let how = match (enabled, problem, command) {
+            (false, ..) => format!("[harness.{}] enabled = false", h.id()),
+            (true, Some(p), _) => p.clone(),
+            (true, None, Some(c)) => c,
+            (true, None, None) => format!("falta `{}`: {}", h.info().program, h.info().install),
+        };
+        let _ = writeln!(out, "{:<13} {:<13} {:>8}  {}", h.label(), state, sessions, how);
+        let home = cfg.harness_home(h);
+        let missing = if home.is_dir() { "" } else { " (no existe)" };
+        let _ = writeln!(out, "{:<13} {:<13} {:>8}  datos: {}{missing}", "", "", "", crate::paths::display(&home));
     }
     Ok(())
 }

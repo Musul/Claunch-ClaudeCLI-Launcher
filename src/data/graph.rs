@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use super::{Aliases, Catalog, LiveSession};
+use crate::harness::Harness;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Status {
@@ -206,11 +207,18 @@ fn node(key: &str, last_ms: i64, catalog: &Catalog, live: &HashMap<String, LiveS
             .or_else(|| l.and_then(|l| l.name.clone()))
             .or_else(|| names.get(key).cloned())
             .unwrap_or_else(|| format!("sesión {}", &id[..id.len().min(8)]));
-        let sub = s
+        let repo = s
             .and_then(|s| catalog.repo(&s.repo_key))
             .map(|r| r.name.clone())
             .or_else(|| l.and_then(|l| std::path::Path::new(&l.cwd).file_name().map(|n| n.to_string_lossy().into_owned())))
             .unwrap_or_default();
+        // Las sesiones que no son de Claude dicen de qué agente son.
+        let harness = s.map(|s| s.meta.harness).or(l.map(|l| l.harness)).unwrap_or_default();
+        let sub = match (harness, repo.is_empty()) {
+            (Harness::Claude, _) => repo,
+            (h, true) => h.tag().to_string(),
+            (h, false) => format!("{} · {repo}", h.tag()),
+        };
         let status = match l {
             Some(l) if l.is_busy() => Status::Busy,
             Some(l) if l.is_waiting() => Status::Waiting,
@@ -284,6 +292,23 @@ mod tests {
         assert_eq!(from.session_id.as_deref(), Some("A"));
         assert_eq!(from.status, Status::Closed);
         assert_eq!(g.nodes[g.edges[0].to].status, Status::Busy);
+    }
+
+    #[test]
+    fn other_harness_sessions_are_tagged() {
+        let codex = SessionMeta { harness: Harness::Codex, ..meta("X", vec![]) };
+        let catalog = Catalog::build(&[meta("A", vec![]), codex], &[]);
+        let mut live = HashMap::new();
+        for (id, harness) in [("A", Harness::Claude), ("X", Harness::Codex), ("claunch:9", Harness::Pi)] {
+            live.insert(id.to_string(), LiveSession { harness, session_id: id.into(), cwd: "/r/app".into(), ..Default::default() });
+        }
+        let g = build(&catalog, &live, &Aliases::new(), 1_000, 10_000, 20);
+        let sub = |id: &str| g.nodes.iter().find(|n| n.session_id.as_deref() == Some(id)).map(|n| n.sub.clone()).unwrap();
+        assert!(!sub("A").contains("claude"), "{}", sub("A"));
+        assert!(sub("X").starts_with("codex · "), "{}", sub("X"));
+        // Abierta por claunch y aún sin sesión en el índice: el agente y la carpeta.
+        assert_eq!(sub("claunch:9"), "pi · app");
+        assert!(g.nodes.iter().all(|n| n.status == Status::Idle));
     }
 
     #[test]

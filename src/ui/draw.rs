@@ -13,6 +13,7 @@ use crate::config::{SessionRef, SetLayout};
 use crate::data::graph::{Graph, Status};
 use crate::data::usage::{Limit, Usage};
 use crate::data::{RootKind, Session, UsageState};
+use crate::harness::Harness;
 use crate::{launch, paths, util};
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -94,12 +95,9 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
         }
         _ if !app.loaded => vec![Span::styled(format!("  {} cargando…", widgets::spinner(ms)), accent())],
         _ => match (&app.env, &app.cfg_error) {
-            (Err(_), _) => vec![Span::styled(
-                if cfg!(windows) { "  ⚠ falta claude o Git Bash" } else { "  ⚠ no encuentro claude" },
-                bold(RED),
-            )],
+            (Err(_), _) => vec![Span::styled("  ⚠ entorno de arranque inválido", bold(RED))],
             (_, Some(_)) => vec![Span::styled("  ⚠ config.toml inválido", bold(AMBER))],
-            _ => vec![Span::styled(concat!("  Claude Code launcher v", env!("CARGO_PKG_VERSION")), faint())],
+            _ => agent_spans(&app.installed(), w.saturating_sub(used(&l0))),
         },
     };
     if !app.loaded || matches!(app.progress, Some((d, t)) if d < t) {
@@ -128,6 +126,33 @@ fn draw_header(f: &mut Frame, app: &mut App, area: Rect) {
             cell.set_symbol("─").set_fg(color);
         }
     }
+}
+
+/// Rótulo de la cabecera: los agentes que se pueden lanzar, cada uno con su
+/// color, y la versión. Se acorta si no cabe en `room` columnas.
+fn agent_spans(installed: &[Harness], room: usize) -> Vec<Span<'static>> {
+    let version = concat!("v", env!("CARGO_PKG_VERSION"));
+    if installed.is_empty() {
+        // El aviso no puede perderse por falta de sitio: se acorta hasta caber.
+        let texts = ["  ⚠ no encuentro ningún agente (claude, codex, opencode, agy, pi)", "  ⚠ no encuentro ningún agente", "  ⚠ sin agentes"];
+        let text = texts.into_iter().find(|t| util::width(t) <= room).unwrap_or(texts[2]);
+        return vec![Span::styled(text, bold(RED))];
+    }
+    let mut full = vec![Span::raw("  ")];
+    for (i, h) in installed.iter().enumerate() {
+        if i > 0 {
+            full.push(Span::styled(" · ", Style::new().fg(BORDER)));
+        }
+        full.push(Span::styled(h.tag(), Style::new().fg(theme::harness_color(*h))));
+    }
+    full.push(Span::styled(format!("   {version}"), faint()));
+    let width = |v: &[Span<'static>]| v.iter().map(|s| s.width()).sum::<usize>();
+    if width(&full) <= room {
+        return full;
+    }
+    let n = installed.len();
+    let short = format!("  {n} {} · {version}", if n == 1 { "agente" } else { "agentes" });
+    vec![Span::styled(if util::width(&short) <= room { short } else { format!("  {version}") }, faint())]
 }
 
 /// Conteos de la cabecera: repos, sesiones, activas, trabajando y en espera.
@@ -226,7 +251,9 @@ fn usage_spans(app: &mut App, w: usize, ms: u128) -> Option<Vec<Span<'static>>> 
         }
     };
     let stale = warn.is_some() || now - u.fetched_ms > 3 * 60_000;
-    let plan = u.plan_label().map(|p| Span::styled(format!("Plan {p}   "), bold(ACCENT_SOFT)));
+    // Con más agentes a la vista, se dice de quién es el plan.
+    let whose = if app.installed().len() > 1 || app.catalog.mixed() { "Claude" } else { "Plan" };
+    let plan = u.plan_label().map(|p| Span::styled(format!("{whose} {p}   "), bold(ACCENT_SOFT)));
     let tail = |v: &mut Vec<Span<'static>>, room: usize| {
         if let Some(r) = &warn {
             let used: usize = v.iter().map(|s| s.width()).sum();
@@ -293,7 +320,8 @@ fn draw_crumb(f: &mut Frame, app: &App, area: Rect) {
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let hints: Vec<(&str, &str)> = match (&app.modal, app.stack.last()) {
         (Some(Modal::Options(_)), _) => vec![("↑↓", "campo"), ("←→", "cambiar"), ("⏎", "confirmar"), ("esc", "cancelar")],
-        (Some(Modal::Guard(_)), _) => vec![("f", "fork"), ("a", "abrir igual"), ("esc", "cancelar")],
+        (Some(Modal::Guard(g)), _) if g.can_fork => vec![("f", "fork"), ("a", "abrir igual"), ("esc", "cancelar")],
+        (Some(Modal::Guard(_)), _) => vec![("a", "abrir igual"), ("esc", "cancelar")],
         (Some(Modal::Confirm(_)), _) => vec![("s", "sí"), ("n", "no"), ("←→", "elegir"), ("⏎", "confirmar")],
         (Some(Modal::Help), _) => vec![("cualquier tecla", "cerrar")],
         (None, None) => match app.home.focus {
@@ -306,9 +334,18 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 ("n", "nuevo set"), ("B", "bypass"), ("?", "ayuda"), ("q", "salir"),
             ],
         },
-        (None, Some(Screen::Repo { pick: Some(_), .. })) => vec![("↑↓", "mover"), ("⏎", "elegir"), ("/", "filtrar"), ("esc", "volver")],
-        (None, Some(Screen::Repo { .. })) => {
-            vec![("↑↓", "mover"), ("⏎", "abrir"), ("o", "opciones"), ("/", "filtrar"), ("r", "refrescar"), ("esc", "volver")]
+        (None, Some(Screen::Repo { pick, .. })) => {
+            let mut v = if pick.is_some() {
+                vec![("↑↓", "mover"), ("⏎", "elegir"), ("/", "filtrar"), ("esc", "volver")]
+            } else {
+                vec![("↑↓", "mover"), ("⏎", "abrir"), ("o", "opciones"), ("/", "filtrar"), ("r", "refrescar"), ("esc", "volver")]
+            };
+            // Con varios agentes, ⇥ elige el de «Nueva sesión».
+            if app.installed().len() > 1 {
+                let at = v.iter().position(|(k, _)| *k == "/").unwrap_or(v.len());
+                v.insert(at, ("⇥", "agente"));
+            }
+            v
         }
         (None, Some(Screen::PickRepo { .. })) => vec![("↑↓", "mover"), ("⏎", "elegir repo"), ("/", "filtrar"), ("esc", "volver")],
         (None, Some(Screen::Map { .. })) => {
@@ -357,8 +394,15 @@ fn session_lines(app: &mut App, s: &Session, selected: bool, width: u16, show_re
     let title_style = if selected { bold(TEXT) } else { text() };
     left.push(Span::styled(s.meta.title().to_string(), title_style));
     let time = Span::styled(util::relative_time(s.meta.mtime_ms, now), if selected { dim() } else { faint() });
-    let tw = time.width() + 2;
-    let l1 = split_line(clip(left, w.saturating_sub(tw)), vec![time], w);
+    // Con sesiones de varios agentes, cada fila dice de cuál es.
+    let mut right = Vec::new();
+    if app.catalog.mixed() {
+        right.push(Span::styled(s.meta.harness.tag(), Style::new().fg(theme::harness_color(s.meta.harness))));
+        right.push(Span::raw("  "));
+    }
+    right.push(time);
+    let tw = right.iter().map(|s| s.width()).sum::<usize>() + 2;
+    let l1 = split_line(clip(left, w.saturating_sub(tw)), right, w);
 
     let sep = || Span::styled("  ·  ", Style::new().fg(BORDER));
     let mut meta: Vec<Span<'static>> = Vec::new();
@@ -389,8 +433,14 @@ fn session_lines(app: &mut App, s: &Session, selected: bool, width: u16, show_re
         push(&mut meta, Span::styled(surface, Style::new().fg(color)));
     }
     if !show_repo {
+        if let Some(m) = &s.meta.model {
+            push(&mut meta, Span::styled(m.clone(), dim()));
+        }
         push(&mut meta, Span::styled(format!("{} prompts", s.meta.prompts), faint()));
-        push(&mut meta, Span::styled(util::human_size(s.meta.size), faint()));
+        // Sin archivo propio (sesiones guardadas en una base de datos) no hay tamaño.
+        if s.meta.size > 0 {
+            push(&mut meta, Span::styled(util::human_size(s.meta.size), faint()));
+        }
     }
     if let Some(pr) = s.meta.pr_number {
         push(&mut meta, Span::styled(format!("PR #{pr}"), Style::new().fg(GREEN)));
@@ -532,7 +582,7 @@ fn draw_panel(f: &mut Frame, app: &mut App, p: Panel, area: Rect) {
             app.home.recents.sync(&keys);
             f.render_widget(filter_title(p.title(), rows.len(), &filter, focused), area);
             if rows.is_empty() {
-                empty(f, area, if app.loaded { "Aún no hay sesiones de Claude" } else { "Cargando sesiones…" });
+                empty(f, area, if app.loaded { "Aún no hay sesiones" } else { "Cargando sesiones…" });
                 return;
             }
             let mut st = std::mem::take(&mut app.home.recents);
@@ -592,18 +642,40 @@ fn draw_repo(f: &mut Frame, app: &mut App, area: Rect, key: &str, list: &mut Lis
     f.render_widget(filter_title(title, n, filter, app.modal.is_none()), rest);
     let catalog = app.catalog.clone();
     let root = paths::display(&repo.root);
+    // Agente de «Nueva sesión»: se nombra (y ⇥ lo cambia) si hay más de uno.
+    let installed = app.installed();
+    let agent = app.new_session_harness();
+    let choose = installed.len() > 1;
+    let agent_spans = |spans: &mut Vec<Span<'static>>| {
+        if choose || agent != Harness::Claude {
+            spans.push(Span::styled("  ·  ", Style::new().fg(BORDER)));
+            spans.push(Span::styled(agent.label(), bold(theme::harness_color(agent))));
+        }
+        if !installed.contains(&agent) {
+            spans.push(Span::styled("  sin instalar", bold(RED)));
+        }
+    };
     let (inner, off) = widgets::draw_list(f, rest, list, rows.len(), 2, |i, sel, w| match rows[i] {
-        SessRow::New => vec![
-            Line::from(vec![Span::styled("✦ ", bold(ACCENT)), Span::styled("Nueva sesión", bold(if sel { ACCENT_SOFT } else { ACCENT }))]),
-            Line::from(clip(
-                vec![Span::styled(if pick { "Una sesión desde cero cada vez que abras el set".to_string() } else { format!("Claude desde cero en {root}") }, faint())],
-                w as usize,
-            )),
-        ],
-        SessRow::Latest => vec![
-            Line::from(vec![Span::styled("↻ ", bold(ACCENT)), Span::styled("Última sesión de este repo", bold(if sel { ACCENT_SOFT } else { ACCENT }))]),
-            Line::from(Span::styled("Se elige al abrir el set: siempre la más reciente", faint())),
-        ],
+        SessRow::New => {
+            let mut l1 = vec![Span::styled("✦ ", bold(ACCENT)), Span::styled("Nueva sesión", bold(if sel { ACCENT_SOFT } else { ACCENT }))];
+            agent_spans(&mut l1);
+            let hint = if choose { vec![Span::styled("⇥ cambia de agente", faint())] } else { Vec::new() };
+            let sub = if pick { "Una sesión desde cero cada vez que abras el set".to_string() } else { format!("{} desde cero en {root}", agent.label()) };
+            vec![split_line(l1, hint, w as usize), Line::from(clip(vec![Span::styled(sub, faint())], w as usize))]
+        }
+        SessRow::Latest => {
+            let mut l1 = vec![
+                Span::styled("↻ ", bold(ACCENT)),
+                Span::styled("Última sesión de este repo", bold(if sel { ACCENT_SOFT } else { ACCENT })),
+            ];
+            agent_spans(&mut l1);
+            let sub = if choose {
+                format!("Se elige al abrir el set: siempre la más reciente de {}", agent.label())
+            } else {
+                "Se elige al abrir el set: siempre la más reciente".to_string()
+            };
+            vec![Line::from(clip(l1, w as usize)), Line::from(clip(vec![Span::styled(sub, faint())], w as usize))]
+        }
         SessRow::Session(s) => session_lines(app, &catalog.sessions[s], sel, w, false),
     });
     if app.modal.is_none() {
@@ -697,7 +769,7 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect, set: usize, row: usize,
             EdRow::Entry(ei) => {
                 let e = &s.entries[*ei];
                 let title = entry_label(e, &app.catalog);
-                let color = theme::parse_hex(e.tab_color.as_deref().unwrap_or(&app.cfg.general.tab_color)).unwrap_or(ACCENT);
+                let color = theme::parse_hex(&app.entry_color(e)).unwrap_or(ACCENT);
                 let l1 = vec![
                     gutter.clone(),
                     Span::styled(format!("{} ", ei + 1), faint()),
@@ -713,6 +785,11 @@ fn draw_editor(f: &mut Frame, app: &mut App, area: Rect, set: usize, row: usize,
                     }
                 };
                 let mut meta = vec![what];
+                // El agente, si no es Claude o hay varios donde elegir (el de una sesión concreta es el suyo).
+                let harness = app.entry_harness(e);
+                if harness != Harness::Claude || app.installed().len() > 1 {
+                    meta.insert(0, harness.label().to_string());
+                }
                 // La shell solo se elige en Windows.
                 if cfg!(windows) {
                     meta.push(e.options.shell.unwrap_or(app.cfg.general.default_shell).label().to_string());
@@ -771,7 +848,7 @@ fn draw_layout_preview(f: &mut Frame, app: &App, area: Rect, s: &crate::config::
         .entries
         .iter()
         .map(|e| {
-            let c = theme::parse_hex(e.tab_color.as_deref().unwrap_or(&app.cfg.general.tab_color)).unwrap_or(ACCENT);
+            let c = theme::parse_hex(&app.entry_color(e)).unwrap_or(ACCENT);
             (entry_label(e, &app.catalog), c)
         })
         .collect();
@@ -1131,11 +1208,18 @@ fn draw_map_detail(f: &mut Frame, app: &App, area: Rect, g: &Graph, si: Option<u
                 if let Some(wf) = l.waiting_for.as_deref().filter(|_| l.is_waiting()) {
                     st = format!("{st} ({wf})");
                 }
+                if l.harness != Harness::Claude {
+                    st = format!("{st} · {}", l.harness.label());
+                }
                 let (surface, _) = theme::entrypoint(&l.entrypoint);
                 if !surface.is_empty() {
                     st = format!("{st} · {surface}");
                 }
                 st = format!("{st} · pid {}", l.pid);
+            } else if let Some(s) = node.session_id.as_deref().and_then(|id| app.catalog.session(id))
+                && s.meta.harness != Harness::Claude
+            {
+                st = format!("{st} · {}", s.meta.harness.label());
             }
             lines.push(Line::from(Span::styled(util::truncate(&st, w), dim())));
             if node.subagents > 0 {
@@ -1280,6 +1364,7 @@ fn draw_options(f: &mut Frame, area: Rect, m: &OptionsModal) -> Rect {
 fn draw_guard(f: &mut Frame, area: Rect, m: &GuardModal) -> Rect {
     let n = m.conflicts.len().min(4) as u16;
     let rect = widgets::centered(area, 72, 11 + n * 2 + u16::from(m.conflicts.len() > 4));
+    let choices = m.choices();
     let title = Line::from(vec![
         Span::styled(" ⚠ ", bold(AMBER)),
         Span::styled(if n > 1 { "Sesiones ya abiertas " } else { "Sesión ya abierta " }, bold(TEXT)),
@@ -1297,9 +1382,17 @@ fn draw_guard(f: &mut Frame, area: Rect, m: &GuardModal) -> Rect {
     lines.push(Line::raw(""));
     lines.push(Line::from(Span::styled("Abrirla otra vez pone a dos procesos a escribir", text())));
     lines.push(Line::from(Span::styled("el mismo historial.", text())));
-    lines.push(Line::raw(""));
-    let opts = [("f", "Abrir como fork", "copia nueva y segura"), ("a", "Abrir igual", "bajo tu riesgo"), ("esc", "Cancelar", "")];
-    for (i, (k, label, hint)) in opts.iter().enumerate() {
+    if m.can_fork {
+        lines.push(Line::raw(""));
+    } else {
+        lines.push(Line::from(Span::styled("Este agente no sabe abrirla como copia (fork).", faint())));
+    }
+    let opts = choices.iter().map(|c| match c {
+        GuardChoice::Fork => ("f", "Abrir como fork", "copia nueva y segura"),
+        GuardChoice::OpenAnyway => ("a", "Abrir igual", "bajo tu riesgo"),
+        GuardChoice::Cancel => ("esc", "Cancelar", ""),
+    });
+    for (i, (k, label, hint)) in opts.enumerate() {
         let on = i == m.choice;
         lines.push(Line::from(vec![
             Span::styled(if on { "▌ " } else { "  " }, Style::new().fg(AMBER)),
@@ -1343,7 +1436,7 @@ fn draw_confirm(f: &mut Frame, area: Rect, m: &ConfirmModal) -> Rect {
 }
 
 fn draw_help(f: &mut Frame, area: Rect) -> Rect {
-    let rect = widgets::centered(area, 74, 30);
+    let rect = widgets::centered(area, 74, 31);
     let title = Line::from(vec![Span::styled(" ? ", bold(ACCENT)), Span::styled("Atajos ", bold(TEXT))]);
     let inner = widgets::modal_frame(f, rect, title, ACCENT);
     let groups: [(&str, &[(&str, &str)]); 4] = [
@@ -1351,12 +1444,14 @@ fn draw_help(f: &mut Frame, area: Rect) -> Rect {
         (
             "Sesiones",
             &[
-                ("o", if cfg!(windows) { "opciones: destino, shell, fork, modelo, permisos" } else { "opciones: destino, fork, modelo, permisos" }),
+                // Como mucho 52 columnas: es lo que cabe junto a la tecla.
+                ("o", if cfg!(windows) { "opciones: destino, shell, agente, modelo, permisos" } else { "opciones: destino, agente, fork, modelo, permisos" }),
+                ("⇥", "en un repo: agente de «Nueva sesión»"),
                 ("r  F5", "reescanear repos y sesiones"),
             ],
         ),
         ("Sets", &[("n", "nuevo set"), ("e", "editar"), ("d", "borrar / quitar entrada"), ("a", "añadir sesión"), ("⇧↑↓", "reordenar")]),
-        ("Global", &[("m", "mapa: cómo se comunican las sesiones"), ("B", "bypass global de permisos (settings.json)"), ("q  ctrl+c", "salir")]),
+        ("Global", &[("m", "mapa: cómo se comunican las sesiones"), ("B", "bypass global de permisos de Claude (settings.json)"), ("q  ctrl+c", "salir")]),
     ];
     let mut lines = Vec::new();
     for (g, keys) in groups {
